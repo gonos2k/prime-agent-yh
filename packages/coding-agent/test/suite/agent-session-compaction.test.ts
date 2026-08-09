@@ -931,6 +931,78 @@ describe("AgentSession compaction characterization", () => {
 		expect(sessionInternals._postCompactionContinuationScheduled).toBe(true);
 	});
 
+	it("records terminal post-compaction continuation failures instead of swallowing them", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as {
+			_schedulePostCompactionContinue(): void;
+			_postCompactionContinuationMessages: AgentMessage[];
+			_postCompactionContinuationScheduled: boolean;
+		};
+		const queuedMessage = {
+			role: "user",
+			content: [{ type: "text", text: "continue queued work" }],
+			timestamp: Date.now(),
+		} satisfies AgentMessage;
+		sessionInternals._postCompactionContinuationMessages = [queuedMessage];
+		harness.session.agent.followUp(queuedMessage);
+		const continueSpy = vi
+			.spyOn(harness.session.agent, "continue")
+			.mockRejectedValueOnce(new Error("provider disconnected"));
+
+		sessionInternals._schedulePostCompactionContinue();
+		await vi.advanceTimersByTimeAsync(100);
+		await harness.session.waitForIdle();
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(sessionInternals._postCompactionContinuationScheduled).toBe(false);
+		expect(sessionInternals._postCompactionContinuationMessages).toEqual([queuedMessage]);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "post_compaction_continuation_failure",
+			display: true,
+			content: expect.stringContaining("provider disconnected"),
+			details: { error: "provider disconnected" },
+		});
+		expect(harness.sessionManager.getEntries().at(-1)).toMatchObject({
+			type: "custom_message",
+			customType: "post_compaction_continuation_failure",
+			display: true,
+			content: expect.stringContaining("provider disconnected"),
+			details: { error: "provider disconnected" },
+		});
+	});
+
+	it("resumes interrupted threshold work when compaction is skipped", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals & {
+			_continueAfterThresholdCompaction: boolean;
+			_schedulePostCompactionContinue(): void;
+			_cancelPostCompactionContinue(): void;
+			_postCompactionContinuationScheduled: boolean;
+		};
+		const scheduleSpy = vi.spyOn(sessionInternals, "_schedulePostCompactionContinue");
+
+		try {
+			sessionInternals._continueAfterThresholdCompaction = true;
+			const compacted = await sessionInternals._runAutoCompaction("threshold", false);
+
+			expect(compacted).toBe(false);
+			expect(scheduleSpy).toHaveBeenCalledTimes(1);
+			expect(sessionInternals._postCompactionContinuationScheduled).toBe(true);
+			expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+				reason: "threshold",
+				errorSeverity: "warning",
+				errorMessage: expect.stringContaining("Session is too short to compact"),
+			});
+		} finally {
+			sessionInternals._cancelPostCompactionContinue();
+		}
+	});
+
 	it("clears queued autonomous threshold continuations when autonomous mode is disabled", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({

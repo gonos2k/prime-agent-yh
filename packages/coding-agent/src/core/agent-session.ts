@@ -179,6 +179,7 @@ import {
 	type CustomMessage,
 	createCompactionOutcomeMessage,
 	createHeartbeatPromptMessage,
+	createPostCompactionContinuationFailureMessage,
 	createRlmChildFailureMessage,
 	createRlmChildTerminalNoticeMessage,
 	createSessionSlashCommandMessage,
@@ -7221,6 +7222,28 @@ export class AgentSession {
 		this._postCompactionContinuationSettled = undefined;
 	}
 
+	private _recordPostCompactionContinuationFailure(errorMessage: string): void {
+		const details = { error: errorMessage };
+		let failureMessage = createPostCompactionContinuationFailureMessage(details);
+		try {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				failureMessage.customType,
+				failureMessage.content,
+				failureMessage.display,
+				failureMessage.details,
+			);
+		} catch (error) {
+			const persistenceError = error instanceof Error ? error.message : String(error);
+			failureMessage = {
+				...failureMessage,
+				content: `${failureMessage.content}\n\nThis failure notice could not be saved to session history: ${persistenceError}`,
+			};
+		}
+		this.agent.state.messages.push(failureMessage);
+		this._emit({ type: "message_start", message: failureMessage });
+		this._emit({ type: "message_end", message: failureMessage });
+	}
+
 	private _discardPendingAutoRefine(options: { cancelPostCompactionContinue?: boolean } = {}): void {
 		this._compactAutoRefinePending = false;
 		this._turnIntervalAutoRefinePending = false;
@@ -7380,6 +7403,8 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : String(error);
 			if (message.includes("already processing")) {
 				this._schedulePostCompactionContinue();
+			} else {
+				this._recordPostCompactionContinuationFailure(message);
 			}
 		} finally {
 			if (!this._postCompactionContinuationScheduled) {
@@ -8130,10 +8155,12 @@ export class AgentSession {
 				: [];
 		this._continueAfterThresholdCompaction = false;
 
-		// A requested compaction stopped the loop on purpose; don't stall if it fails.
+		// Requested and threshold compaction can stop the loop on purpose. If
+		// compaction is skipped or fails, resume any work that still belongs to
+		// the session instead of reporting a false terminal idle state.
 		const resumeAfterFailure = () => {
 			if (
-				reason === "requested" &&
+				(reason === "requested" || reason === "threshold") &&
 				(shouldContinueAfterCompaction || this.agent.hasQueuedMessages() || this.hasPendingSessionWork)
 			) {
 				this._schedulePostCompactionContinue();

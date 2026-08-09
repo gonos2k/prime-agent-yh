@@ -9,7 +9,7 @@ import {
 	renameSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { isDeepStrictEqual } from "node:util";
+import { isDeepStrictEqual, TextDecoder } from "node:util";
 import { writeAllSync } from "../../utils/write-all-sync.js";
 import type { DaemonClientId, DaemonCommandId, DaemonResponse } from "./daemon-protocol.js";
 
@@ -52,6 +52,7 @@ export type CommandJournalBeginResult =
 
 const COMPACT_AFTER_RECORDS = 4096;
 const LINE_FEED = 0x0a;
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 export function createCommandIdempotencyKey(clientId: DaemonClientId, commandId: DaemonCommandId): string {
 	return JSON.stringify([clientId, commandId]);
@@ -59,6 +60,49 @@ export function createCommandIdempotencyKey(clientId: DaemonClientId, commandId:
 
 function journalCorruption(lineNumber: number, reason: string): Error {
 	return new Error(`Invalid command recovery journal record at line ${lineNumber}: ${reason}`);
+}
+
+function asObject(value: unknown, lineNumber: number, label: string): Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw journalCorruption(lineNumber, `${label} must be a JSON object`);
+	}
+	return value as Record<string, unknown>;
+}
+
+function decodeJournalLine(bytes: Uint8Array, lineNumber: number): string {
+	try {
+		return UTF8_DECODER.decode(bytes);
+	} catch {
+		throw journalCorruption(lineNumber, "record is not valid UTF-8");
+	}
+}
+
+function parseCompleteLine(bytes: Uint8Array, lineNumber: number): unknown {
+	const line = decodeJournalLine(bytes, lineNumber);
+	try {
+		return JSON.parse(line) as unknown;
+	} catch {
+		throw journalCorruption(lineNumber, "malformed JSON outside the final partial append");
+	}
+}
+
+function parseDaemonResponse(value: unknown, lineNumber: number): DaemonResponse {
+	const response = asObject(value, lineNumber, "result response");
+	if (
+		response.type !== "response" ||
+		typeof response.id !== "string" ||
+		typeof response.command !== "string" ||
+		typeof response.success !== "boolean"
+	) {
+		throw journalCorruption(lineNumber, "result response has an invalid envelope");
+	}
+	if (response.success === false && typeof response.error !== "string") {
+		throw journalCorruption(lineNumber, "failed result response is missing an error");
+	}
+	if (response.errorInfo !== undefined) {
+		asObject(response.errorInfo, lineNumber, "result response errorInfo");
+	}
+	return value as DaemonResponse;
 }
 
 function assertCommandTypeMatches(entry: JournalEntry, key: string, commandType: string): void {
@@ -202,69 +246,81 @@ export class CommandRecoveryJournal {
 			throw error;
 		}
 
-		const hasTrailingNewline = contents.length === 0 || contents[contents.length - 1] === LINE_FEED;
-		const lastNewlineIndex = hasTrailingNewline ? contents.length - 1 : contents.lastIndexOf(LINE_FEED);
-		const completeByteLength = hasTrailingNewline ? contents.length : lastNewlineIndex + 1;
-		const completeLines = contents.subarray(0, completeByteLength).toString("utf8").split("\n");
-
-		for (let index = 0; index < completeLines.length; index++) {
-			const line = completeLines[index];
-			if (!line) continue;
-			this.applyParsedRecord(this.parseCompleteLine(line, index + 1), index + 1);
+		let lineStart = 0;
+		let lineNumber = 1;
+		for (let index = 0; index < contents.length; index++) {
+			if (contents[index] !== LINE_FEED) continue;
+			const line = contents.subarray(lineStart, index);
+			if (line.length > 0) {
+				this.applyParsedRecord(parseCompleteLine(line, lineNumber), lineNumber);
+			}
+			lineStart = index + 1;
+			lineNumber++;
 		}
 
-		if (hasTrailingNewline) {
+		if (lineStart === contents.length) {
 			return;
 		}
 
-		const finalLineNumber = completeLines.length;
-		const tail = contents.subarray(completeByteLength).toString("utf8");
+		const tailBytes = contents.subarray(lineStart);
+		let tail: string;
+		try {
+			tail = UTF8_DECODER.decode(tailBytes);
+		} catch {
+			// Invalid UTF-8 at the unterminated tail is crash-shaped and cannot
+			// contain a durable record, so discard it before accepting new appends.
+			this.truncateTo(lineStart);
+			return;
+		}
+
 		let parsedTail: unknown;
 		try {
 			parsedTail = JSON.parse(tail) as unknown;
 		} catch {
 			// A crash may leave one incomplete final append. Remove it now so a
 			// subsequent append cannot concatenate a valid record onto corrupt bytes.
-			this.truncateTo(completeByteLength);
+			this.truncateTo(lineStart);
 			return;
 		}
 
 		// A complete final record whose line feed was not persisted remains valid.
 		// Apply it and restore the append boundary before accepting new writes.
-		this.applyParsedRecord(parsedTail, finalLineNumber);
+		this.applyParsedRecord(parsedTail, lineNumber);
 		this.appendMissingLineFeed();
 	}
 
-	private parseCompleteLine(line: string, lineNumber: number): unknown {
-		try {
-			return JSON.parse(line) as unknown;
-		} catch {
-			throw journalCorruption(lineNumber, "malformed JSON outside the final partial append");
-		}
-	}
-
 	private applyParsedRecord(parsedValue: unknown, lineNumber: number): void {
-		if (typeof parsedValue !== "object" || parsedValue === null || Array.isArray(parsedValue)) {
-			throw journalCorruption(lineNumber, "record must be a JSON object");
-		}
-		const parsed = parsedValue as Record<string, unknown>;
-		if (parsed.version !== 1 || typeof parsed.type !== "string" || typeof parsed.key !== "string") {
-			throw journalCorruption(lineNumber, "unsupported version or missing type/key");
+		const parsed = asObject(parsedValue, lineNumber, "record");
+		if (
+			parsed.version !== 1 ||
+			typeof parsed.type !== "string" ||
+			typeof parsed.key !== "string" ||
+			typeof parsed.recordedAt !== "string"
+		) {
+			throw journalCorruption(lineNumber, "unsupported version or missing type/key/recordedAt");
 		}
 		if (parsed.type !== "received" && parsed.type !== "result" && parsed.type !== "acknowledged") {
 			throw journalCorruption(lineNumber, `unknown record type ${JSON.stringify(parsed.type)}`);
 		}
 
-		const record = parsed as unknown as JournalRecord;
 		this.recordCount++;
-		if (record.type === "received") {
+		if (parsed.type === "received") {
 			if (
-				typeof record.clientId !== "string" ||
-				typeof record.commandId !== "string" ||
-				typeof record.commandType !== "string"
+				typeof parsed.clientId !== "string" ||
+				typeof parsed.commandId !== "string" ||
+				typeof parsed.commandType !== "string"
 			) {
 				throw journalCorruption(lineNumber, "received record is missing clientId, commandId, or commandType");
 			}
+			const record: ReceivedRecord = {
+				version: 1,
+				type: "received",
+				key: parsed.key,
+				clientId: parsed.clientId,
+				commandId: parsed.commandId,
+				commandType: parsed.commandType,
+				recordedAt: parsed.recordedAt,
+			};
 			const expectedKey = createCommandIdempotencyKey(record.clientId, record.commandId);
 			if (record.key !== expectedKey) {
 				throw journalCorruption(lineNumber, `non-canonical key ${record.key}; expected ${expectedKey}`);
@@ -282,29 +338,28 @@ export class CommandRecoveryJournal {
 			return;
 		}
 
-		const entry = this.entries.get(record.key);
+		const entry = this.entries.get(parsed.key);
 		if (!entry) {
-			throw journalCorruption(lineNumber, `${record.type} record has no preceding received record`);
+			throw journalCorruption(lineNumber, `${parsed.type} record has no preceding received record`);
 		}
-		if (record.type === "acknowledged") {
+		if (parsed.type === "acknowledged") {
 			if (!entry.response) {
 				throw journalCorruption(lineNumber, "acknowledged record has no preceding durable result");
 			}
-			this.entries.delete(record.key);
+			this.entries.delete(parsed.key);
 			return;
 		}
-		if (!record.response || record.response.type !== "response") {
-			throw journalCorruption(lineNumber, "result record is missing a daemon response");
-		}
+
+		const response = parseDaemonResponse(parsed.response, lineNumber);
 		try {
-			assertResponseMatchesReceipt(entry, record.key, record.response);
+			assertResponseMatchesReceipt(entry, parsed.key, response);
 		} catch (error) {
 			throw journalCorruption(lineNumber, (error as Error).message);
 		}
-		if (entry.response && !responsesEqual(entry.response, record.response)) {
+		if (entry.response && !responsesEqual(entry.response, response)) {
 			throw journalCorruption(lineNumber, "conflicting durable results for one idempotency key");
 		}
-		entry.response = record.response;
+		entry.response = response;
 	}
 
 	private truncateTo(byteLength: number): void {

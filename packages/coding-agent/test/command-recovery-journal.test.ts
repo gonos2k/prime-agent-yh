@@ -19,6 +19,18 @@ describe("CommandRecoveryJournal", () => {
 		return join(root, "commands.jsonl");
 	}
 
+	function receivedRecord(clientId = "client-a", commandId = "command-a", commandType = "prompt") {
+		return {
+			version: 1,
+			type: "received" as const,
+			key: createCommandIdempotencyKey(clientId, commandId),
+			clientId,
+			commandId,
+			commandType,
+			recordedAt: new Date().toISOString(),
+		};
+	}
+
 	it("marks received commands uncertain instead of replaying them", () => {
 		const journal = new CommandRecoveryJournal(createPath());
 		expect(journal.begin("client-a", "command-a", "prompt")).toEqual({ status: "new" });
@@ -70,6 +82,30 @@ describe("CommandRecoveryJournal", () => {
 				type: "response",
 				command: "prompt",
 				success: true,
+			},
+		});
+	});
+
+	it("round-trips a UTF-8 failure response without replacement characters", () => {
+		const path = createPath();
+		const journal = new CommandRecoveryJournal(path);
+		journal.begin("client-a", "command-a", "prompt");
+		journal.recordResult("client-a", "command-a", {
+			id: "command-a",
+			type: "response",
+			command: "prompt",
+			success: false,
+			error: "레이더 자료동화 오류",
+		});
+
+		expect(new CommandRecoveryJournal(path).lookup("client-a", "command-a", "prompt")).toEqual({
+			status: "complete",
+			response: {
+				id: "command-a",
+				type: "response",
+				command: "prompt",
+				success: false,
+				error: "레이더 자료동화 오류",
 			},
 		});
 	});
@@ -151,20 +187,22 @@ describe("CommandRecoveryJournal", () => {
 		});
 	});
 
+	it("repairs an invalid UTF-8 sequence in the unterminated final append", () => {
+		const path = createPath();
+		const journal = new CommandRecoveryJournal(path);
+		journal.begin("client-a", "command-a", "prompt");
+		const verifiedPrefix = readFileSync(path);
+		appendFileSync(path, Buffer.from([0xe2, 0x82]));
+
+		const restored = new CommandRecoveryJournal(path);
+
+		expect(restored.lookup("client-a", "command-a", "prompt")).toEqual({ status: "pending" });
+		expect(readFileSync(path)).toEqual(verifiedPrefix);
+	});
+
 	it("restores the missing line feed after a complete final record", () => {
 		const path = createPath();
-		writeFileSync(
-			path,
-			JSON.stringify({
-				version: 1,
-				type: "received",
-				key: createCommandIdempotencyKey("client-a", "command-a"),
-				clientId: "client-a",
-				commandId: "command-a",
-				commandType: "prompt",
-				recordedAt: new Date().toISOString(),
-			}),
-		);
+		writeFileSync(path, JSON.stringify(receivedRecord()));
 
 		const restored = new CommandRecoveryJournal(path);
 		expect(restored.lookup("client-a", "command-a", "prompt")).toEqual({ status: "pending" });
@@ -179,6 +217,20 @@ describe("CommandRecoveryJournal", () => {
 		expect(new CommandRecoveryJournal(path).lookup("client-a", "command-a", "prompt")?.status).toBe("complete");
 	});
 
+	it("fails closed on invalid UTF-8 in a completed record", () => {
+		const path = createPath();
+		writeFileSync(
+			path,
+			Buffer.concat([
+				Buffer.from('{"version":1,"type":"received","key":"', "utf8"),
+				Buffer.from([0xff]),
+				Buffer.from('","recordedAt":"now"}\n', "utf8"),
+			]),
+		);
+
+		expect(() => new CommandRecoveryJournal(path)).toThrow(/line 1: record is not valid UTF-8/);
+	});
+
 	it("fails closed on malformed journal data before the final partial append", () => {
 		const path = createPath();
 		const journal = new CommandRecoveryJournal(path);
@@ -188,18 +240,21 @@ describe("CommandRecoveryJournal", () => {
 		expect(() => new CommandRecoveryJournal(path)).toThrow(/line 2: malformed JSON/);
 	});
 
+	it("fails closed when a record omits recordedAt", () => {
+		const path = createPath();
+		const { recordedAt: _recordedAt, ...record } = receivedRecord();
+		writeFileSync(path, `${JSON.stringify(record)}\n`);
+
+		expect(() => new CommandRecoveryJournal(path)).toThrow(/missing type\/key\/recordedAt/);
+	});
+
 	it("fails closed when a received record carries a non-canonical key", () => {
 		const path = createPath();
 		appendFileSync(
 			path,
 			`${JSON.stringify({
-				version: 1,
-				type: "received",
+				...receivedRecord(),
 				key: createCommandIdempotencyKey("other-client", "other-command"),
-				clientId: "client-a",
-				commandId: "command-a",
-				commandType: "prompt",
-				recordedAt: new Date().toISOString(),
 			})}\n`,
 		);
 
@@ -227,6 +282,49 @@ describe("CommandRecoveryJournal", () => {
 		expect(() => new CommandRecoveryJournal(path)).toThrow(/no preceding received record/);
 	});
 
+	it("fails closed when a result response omits success", () => {
+		const path = createPath();
+		const receipt = receivedRecord();
+		writeFileSync(
+			path,
+			`${JSON.stringify(receipt)}\n${JSON.stringify({
+				version: 1,
+				type: "result",
+				key: receipt.key,
+				response: {
+					id: "command-a",
+					type: "response",
+					command: "prompt",
+				},
+				recordedAt: new Date().toISOString(),
+			})}\n`,
+		);
+
+		expect(() => new CommandRecoveryJournal(path)).toThrow(/result response has an invalid envelope/);
+	});
+
+	it("fails closed when a failed response omits its error", () => {
+		const path = createPath();
+		const receipt = receivedRecord();
+		writeFileSync(
+			path,
+			`${JSON.stringify(receipt)}\n${JSON.stringify({
+				version: 1,
+				type: "result",
+				key: receipt.key,
+				response: {
+					id: "command-a",
+					type: "response",
+					command: "prompt",
+					success: false,
+				},
+				recordedAt: new Date().toISOString(),
+			})}\n`,
+		);
+
+		expect(() => new CommandRecoveryJournal(path)).toThrow(/failed result response is missing an error/);
+	});
+
 	it("rejects acknowledging an uncertain command", () => {
 		const journal = new CommandRecoveryJournal(createPath());
 		journal.begin("client-a", "command-a", "prompt");
@@ -237,21 +335,13 @@ describe("CommandRecoveryJournal", () => {
 
 	it("fails closed when recovery finds an acknowledgement without a durable result", () => {
 		const path = createPath();
-		const key = createCommandIdempotencyKey("client-a", "command-a");
+		const receipt = receivedRecord();
 		writeFileSync(
 			path,
-			`${JSON.stringify({
-				version: 1,
-				type: "received",
-				key,
-				clientId: "client-a",
-				commandId: "command-a",
-				commandType: "prompt",
-				recordedAt: new Date().toISOString(),
-			})}\n${JSON.stringify({
+			`${JSON.stringify(receipt)}\n${JSON.stringify({
 				version: 1,
 				type: "acknowledged",
-				key,
+				key: receipt.key,
 				recordedAt: new Date().toISOString(),
 			})}\n`,
 		);

@@ -551,6 +551,31 @@ export type SerializedBackgroundPlanResult =
 
 export type AutoRefineReviewer = (request: AutoRefineReviewRequest, signal?: AbortSignal) => Promise<AutoRefineReview>;
 
+/** Maximum automatic follow-up turns for one output-token-truncated response chain. */
+const MAX_LENGTH_CONTINUATIONS = 3;
+const LENGTH_CONTINUATION_PROMPT_CUSTOM_TYPE = "length_continuation_prompt";
+const LENGTH_CONTINUATION_PROMPT =
+	"Your previous response was truncated by the output token limit. Continue from exactly where you left off; do not repeat content you already produced.";
+
+/**
+ * A length stop with non-empty text and no tool call means the provider cut
+ * off a user-visible response at its output-token limit. Empty output remains
+ * the context-pressure/overflow path; tool calls remain actionable as-is.
+ */
+export function shouldAutoContinueTruncatedResponse(
+	message: AssistantMessage,
+	continuationCount: number,
+	maxContinuations: number = MAX_LENGTH_CONTINUATIONS,
+): boolean {
+	if (message.stopReason !== "length" || continuationCount >= maxContinuations) {
+		return false;
+	}
+	if (message.content.some((content) => content.type === "toolCall")) {
+		return false;
+	}
+	return message.content.some((content) => content.type === "text" && content.text.trim().length > 0);
+}
+
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
 	/** Whether to expand file-based prompt templates (default: true) */
@@ -1151,6 +1176,8 @@ export class AgentSession {
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	/** One recovery attempt per overflow; "reported" dedups the failure notice. */
 	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
+	/** Consecutive automatic continuations in the current truncated-response chain. */
+	private _lengthContinuations = 0;
 	private _continueAfterThresholdCompaction = false;
 	private _pendingRequestedCompaction: { customInstructions?: string } | undefined;
 	private _pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
@@ -2212,9 +2239,37 @@ export class AgentSession {
 		if (await this._shouldStopForThresholdCompaction(context)) {
 			return true;
 		}
+		// A non-empty `length` result is a partial response, not a successful
+		// terminal answer. Queue a bounded, hidden session-owned steer prompt.
+		if (!this._steeringStopPending && this._shouldAutoContinueTruncation(context.message)) {
+			const sequence = ++this._lengthContinuations;
+			const message: CustomMessage<{ sequence: number }> = {
+				role: "custom",
+				customType: LENGTH_CONTINUATION_PROMPT_CUSTOM_TYPE,
+				content: LENGTH_CONTINUATION_PROMPT,
+				display: false,
+				details: { sequence },
+				timestamp: Date.now(),
+			};
+			await this._queuePreparedPrompt("steer", LENGTH_CONTINUATION_PROMPT, undefined, {
+				message,
+				previewLabel: "Automatic continuation",
+				resumeIfIdle: true,
+				source: "internal",
+				suppressAutonomousContinuation: true,
+			});
+			return false;
+		}
 		// Steering stops continuation only after mandatory serialized checkpoints.
 		// Returning true here still prevents the agent loop from starting another turn.
 		return this._steeringStopPending;
+	}
+
+	private _shouldAutoContinueTruncation(message: AssistantMessage): boolean {
+		if (this._disposed || this._disposing) {
+			return false;
+		}
+		return shouldAutoContinueTruncatedResponse(message, this._lengthContinuations);
 	}
 
 	private async _shouldStopForThresholdCompaction(context: ShouldStopAfterTurnContext): Promise<boolean> {
@@ -3479,6 +3534,9 @@ export class AgentSession {
 
 		if (event.type === "message_start" && this._isPromptTurnStartMessage(event.message)) {
 			this._overflowRecovery = "idle";
+			// The hidden length-continuation custom message is intentionally not a
+			// prompt-turn start, so only genuinely new input resets this budget.
+			this._lengthContinuations = 0;
 		}
 
 		// Emit to extensions first
@@ -3537,6 +3595,9 @@ export class AgentSession {
 				}
 				if (assistantMsg.stopReason !== "error") {
 					this._overflowRecovery = "idle";
+				}
+				if (assistantMsg.stopReason === "stop" || assistantMsg.stopReason === "toolUse") {
+					this._lengthContinuations = 0;
 				}
 				if (this._isConcreteProviderAuthFailure(assistantMsg)) {
 					this._captureRetryAuthFailureSource(assistantMsg);

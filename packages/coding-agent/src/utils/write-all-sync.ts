@@ -16,11 +16,7 @@ const nodeWriteSync: SyncBufferWriter = (descriptor, buffer, offset, length, pos
  * short write without throwing, so callers that establish a durable boundary
  * must advance by the reported count until all bytes have been accepted.
  */
-export function writeAllSync(
-	descriptor: number,
-	data: Uint8Array,
-	writer: SyncBufferWriter = nodeWriteSync,
-): void {
+export function writeAllSync(descriptor: number, data: Uint8Array, writer: SyncBufferWriter = nodeWriteSync): void {
 	let offset = 0;
 	while (offset < data.byteLength) {
 		const remaining = data.byteLength - offset;

@@ -102,6 +102,69 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
 	});
 
+	it("bounds a stuck post-commit extension hook and preserves the committed compaction", async () => {
+		const maintenanceStarted = vi.fn();
+		const neverSettles = new Promise<void>(() => {});
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "bounded maintenance summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+					pi.on("session_compact", async () => {
+						maintenanceStarted();
+						await neverSettles;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		vi.useFakeTimers();
+
+		const compacting = harness.session.compact();
+		await vi.waitFor(() => expect(maintenanceStarted).toHaveBeenCalledOnce());
+		await vi.advanceTimersByTimeAsync(6000);
+		const result = await compacting;
+
+		expect(result.summary).toBe("bounded maintenance summary");
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "manual",
+			aborted: false,
+			willRetry: false,
+		});
+		const compactionEntry = harness.sessionManager.getEntries().find((entry) => entry.type === "compaction");
+		expect(compactionEntry).toBeDefined();
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "post_compaction_maintenance_warning",
+			display: true,
+			content: expect.stringContaining("session_compact_hook timed out after 6000 ms"),
+			details: {
+				compactionEntryId: compactionEntry?.id,
+				issues: [
+					{
+						task: "session_compact_hook",
+						timedOut: true,
+						error: "session_compact_hook timed out after 6000 ms",
+					},
+				],
+			},
+		});
+		expect(harness.sessionManager.getEntries().at(-1)).toMatchObject({
+			type: "custom_message",
+			customType: "post_compaction_maintenance_warning",
+		});
+	});
+
 	it("compacts through the model summarizer, persists metadata, emits events, and remains usable", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },

@@ -397,6 +397,19 @@ type UserBashEndDetails = {
 	errorMessage?: string;
 };
 
+type PostCompactionMaintenanceTask = "session_compact_hook" | "kernel_state_probe" | "rlm_cleanup";
+
+interface PostCompactionMaintenanceIssue {
+	task: PostCompactionMaintenanceTask;
+	error: string;
+	timedOut: boolean;
+}
+
+interface PostCompactionMaintenanceWarningDetails {
+	compactionEntryId?: string;
+	issues: PostCompactionMaintenanceIssue[];
+}
+
 /** Thrown when compaction is skipped for a benign reason (surfaced as a warning, not an error) */
 export class CompactionSkippedError extends Error {}
 
@@ -964,6 +977,9 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 
 /** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+/** Hard deadline for each best-effort task after the compaction entry is durable. */
+const POST_COMPACTION_MAINTENANCE_TIMEOUT_MS = 6000;
+const POST_COMPACTION_MAINTENANCE_WARNING_CUSTOM_TYPE = "post_compaction_maintenance_warning";
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 
 function noopRlmChildAbort(): void {}
@@ -7163,21 +7179,104 @@ export class AgentSession {
 		this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
 		this._restoreLateIpythonSentAgentMessages();
 
-		// Get the saved compaction entry for the extension event
+		// The compaction is durable at this point. Extension notification,
+		// kernel inspection, and stale-child cleanup are best-effort maintenance:
+		// none may convert a committed compaction into an indefinite hang.
 		const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
 			| CompactionEntry
 			| undefined;
-		if (savedCompactionEntry) {
-			await this._extensionRunner.emit({
-				type: "session_compact",
-				compactionEntry: savedCompactionEntry,
-				fromExtension,
-			});
-		}
-		await this._notifyKernelStateAfterCompaction();
-		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
+		await this._runPostCompactionMaintenance(savedCompactionEntry, fromExtension);
 
 		return { summary, firstKeptEntryId, tokensBefore, details };
+	}
+
+	private async _runBoundedPostCompactionMaintenanceTask(
+		task: PostCompactionMaintenanceTask,
+		operation: () => Promise<unknown>,
+		timeoutMs = POST_COMPACTION_MAINTENANCE_TIMEOUT_MS,
+	): Promise<PostCompactionMaintenanceIssue | undefined> {
+		const timeoutError = new Error(`${task} timed out after ${timeoutMs} ms`);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(() => reject(timeoutError), timeoutMs);
+			if (typeof timer === "object" && "unref" in timer) timer.unref();
+		});
+		try {
+			await Promise.race([Promise.resolve().then(operation), timeout]);
+			return undefined;
+		} catch (error) {
+			return {
+				task,
+				error: error instanceof Error ? error.message : String(error),
+				timedOut: error === timeoutError,
+			};
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+
+	private async _runPostCompactionMaintenance(
+		compactionEntry: CompactionEntry | undefined,
+		fromExtension: boolean,
+	): Promise<void> {
+		const issues: PostCompactionMaintenanceIssue[] = [];
+		if (compactionEntry) {
+			const issue = await this._runBoundedPostCompactionMaintenanceTask("session_compact_hook", () =>
+				this._extensionRunner.emit({
+					type: "session_compact",
+					compactionEntry,
+					fromExtension,
+				}),
+			);
+			if (issue) issues.push(issue);
+		}
+		const kernelIssue = await this._runBoundedPostCompactionMaintenanceTask("kernel_state_probe", () =>
+			this._notifyKernelStateAfterCompaction(),
+		);
+		if (kernelIssue) issues.push(kernelIssue);
+		const cleanupIssue = await this._runBoundedPostCompactionMaintenanceTask("rlm_cleanup", () =>
+			this._reapDeletedRlmSubagentRuntimesAfterCompaction(),
+		);
+		if (cleanupIssue) issues.push(cleanupIssue);
+		if (issues.length > 0) {
+			this._recordPostCompactionMaintenanceWarnings(compactionEntry?.id, issues);
+		}
+	}
+
+	private _recordPostCompactionMaintenanceWarnings(
+		compactionEntryId: string | undefined,
+		issues: PostCompactionMaintenanceIssue[],
+	): void {
+		const details: PostCompactionMaintenanceWarningDetails = {
+			compactionEntryId,
+			issues: issues.map((issue) => ({ ...issue })),
+		};
+		const lines = issues.map((issue) => `- ${issue.task}: ${issue.error}`);
+		let warningMessage: CustomMessage<PostCompactionMaintenanceWarningDetails> = {
+			role: "custom",
+			customType: POST_COMPACTION_MAINTENANCE_WARNING_CUSTOM_TYPE,
+			content: ["Post-compaction maintenance completed with warnings:", ...lines].join("\n"),
+			display: true,
+			details,
+			timestamp: Date.now(),
+		};
+		try {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				warningMessage.customType,
+				warningMessage.content,
+				warningMessage.display,
+				warningMessage.details,
+			);
+		} catch (error) {
+			const persistenceError = error instanceof Error ? error.message : String(error);
+			warningMessage = {
+				...warningMessage,
+				content: `${warningMessage.content}\n\nThis warning could not be saved to session history: ${persistenceError}`,
+			};
+		}
+		this.agent.state.messages.push(warningMessage);
+		this._emit({ type: "message_start", message: warningMessage });
+		this._emit({ type: "message_end", message: warningMessage });
 	}
 
 	private async _reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void> {

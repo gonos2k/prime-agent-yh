@@ -102,6 +102,34 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
 	});
 
+	it("restores only the scheduler suspension owned by public manual compaction", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "scheduler restore summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		const internals = harness.session as unknown as {
+			_sessionInputPumpSuspended: boolean;
+		};
+
+		expect(internals._sessionInputPumpSuspended).toBe(false);
+		await harness.session.compact();
+		expect(internals._sessionInputPumpSuspended).toBe(false);
+	});
+
 	it("bounds a stuck post-commit extension hook and preserves the committed compaction", async () => {
 		const maintenanceStarted = vi.fn();
 		const neverSettles = new Promise<void>(() => {});

@@ -7032,8 +7032,16 @@ export class AgentSession {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
+		// Public compaction owns only the suspension it creates. Preserve a
+		// pre-existing suspension, and use the pump epoch so a later external
+		// abort/restart request cannot be accidentally undone in finally.
+		const ownsInputPumpSuspension = !options.skipAbort && !this._sessionInputPumpSuspended;
+		let ownedInputPumpEpoch: number | undefined;
 		this._disconnectFromAgent();
-		if (!options.skipAbort) await this.abort();
+		if (!options.skipAbort) {
+			await this.abort();
+			if (ownsInputPumpSuspension) ownedInputPumpEpoch = this._sessionInputPumpEpoch;
+		}
 		let didCompact = false;
 		this._compactionAbortController = new AbortController();
 		let resolveCompactionOperation: () => void = () => {};
@@ -7096,6 +7104,16 @@ export class AgentSession {
 				this._compactionOperation = undefined;
 			}
 			resolveCompactionOperation();
+			if (
+				ownedInputPumpEpoch !== undefined &&
+				this._sessionInputPumpSuspended &&
+				this._sessionInputPumpEpoch === ownedInputPumpEpoch &&
+				!this._disposed &&
+				!this._disposing
+			) {
+				this._sessionInputPumpSuspended = false;
+				this._notifySessionInputCheckpointChange();
+			}
 			this._scheduleSessionInputPump();
 			if (didCompact) {
 				this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });

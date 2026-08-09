@@ -1,0 +1,89 @@
+name: Apply kernel bootstrap CI isolation
+
+on:
+  push:
+    branches:
+      - ci/isolate-ipython-bootstrap-kernel
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ci/isolate-ipython-bootstrap-kernel
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s "$(which fdfind)" /usr/local/bin/fd
+          python3 -m pip install --user uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Apply deterministic CI split
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          package = Path('packages/coding-agent/package.json')
+          text = package.read_text()
+          old = '"test:ci": "tsx src/core/kernel/bootstrap-cli.ts && vitest --run --exclude test/daemon-supervisor-process.test.ts",'
+          new = '"test:ci": "tsx src/core/kernel/bootstrap-cli.ts && vitest --run --exclude test/daemon-supervisor-process.test.ts --exclude test/ipython-bootstrap.test.ts",'
+          assert text.count(old) == 1
+          text = text.replace(old, new, 1)
+          old = '"test:kernel": "vitest --run --no-file-parallelism --tagsFilter kernel-heavy test/acp-kernel-features.test.ts test/acp-cold-cli.test.ts test/kernel-goal-skill.test.ts test/kernel-state-roundtrip.test.ts"'
+          new = old + ',\n\t\t"test:kernel-bootstrap": "tsx src/core/kernel/bootstrap-cli.ts && vitest --run --no-file-parallelism test/ipython-bootstrap.test.ts"'
+          assert text.count(old) == 1
+          package.write_text(text.replace(old, new, 1))
+
+          workflow = Path('.github/workflows/ci.yml')
+          text = workflow.read_text()
+          anchor = '''          - name: coding-agent kernel
+            package: packages/coding-agent
+            command: npm run test:kernel
+            install_uv: true
+'''
+          replacement = anchor + '''          - name: coding-agent bootstrap kernel
+            package: packages/coding-agent
+            command: npm run test:kernel-bootstrap
+            install_uv: true
+'''
+          assert text.count(anchor) == 1
+          workflow.write_text(text.replace(anchor, replacement, 1))
+          PY
+
+      - name: Install and validate
+        run: |
+          npm ci
+          npm run check
+          npm --prefix packages/coding-agent run test:kernel-bootstrap
+          git diff --check
+
+      - name: Rebuild one functional commit
+        env:
+          BASE_SHA: 2b0316827085586929b3908bd8bcf1658886bc77
+        run: |
+          rm -f .github/workflows/apply-ci-kernel-isolation.yml
+          git add -A
+          git reset --soft "$BASE_SHA"
+
+          changed="$(git diff --cached --name-only | sort)"
+          expected="$(printf '%s\n' '.github/workflows/ci.yml' 'packages/coding-agent/package.json')"
+          test "$changed" = "$expected"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'ci: isolate real IPython bootstrap tests'
+          git push --force origin HEAD:ci/isolate-ipython-bootstrap-kernel

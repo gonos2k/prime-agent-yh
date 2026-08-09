@@ -1178,6 +1178,9 @@ export class AgentSession {
 	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
 	/** Consecutive automatic continuations in the current truncated-response chain. */
 	private _lengthContinuations = 0;
+	/** Exact assistant results for which threshold compaction was already found ineligible. */
+	private readonly _skippedThresholdCompactionMessages = new WeakSet<AssistantMessage>();
+	private _pendingThresholdCompactionMessage: AssistantMessage | undefined;
 	private _continueAfterThresholdCompaction = false;
 	private _pendingRequestedCompaction: { customInstructions?: string } | undefined;
 	private _pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
@@ -2749,6 +2752,14 @@ export class AgentSession {
 		}
 	}
 
+	private _claimThresholdCompactionMessage(message: AssistantMessage): boolean {
+		if (this._skippedThresholdCompactionMessages.has(message)) {
+			return false;
+		}
+		this._pendingThresholdCompactionMessage = message;
+		return true;
+	}
+
 	private async _thresholdCompactionNeeded(context: ShouldStopAfterTurnContext): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
@@ -2762,6 +2773,9 @@ export class AgentSession {
 
 		const contextTokens = this._getThresholdContextTokens(context.message, compactionTimestamp);
 		if (contextTokens === undefined || !shouldCompact(contextTokens, contextWindow, settings)) {
+			return false;
+		}
+		if (!this._claimThresholdCompactionMessage(context.message)) {
 			return false;
 		}
 
@@ -7540,7 +7554,14 @@ export class AgentSession {
 		if (!this._postCompactionContinuationScheduled) {
 			return;
 		}
-		if (this.isStreaming || this.isCompacting || this.isRetrying || this._queuedWorkPauses.size > 0) {
+		if (this._disposed || this._disposing) {
+			this._cancelPostCompactionContinue();
+			return;
+		}
+		// Use the same admission predicate as every session-owned action. This
+		// covers bash, refinement apply, branch mutation, scheduler suspension,
+		// compaction/retry, and lower-agent streaming without another drift-prone list.
+		if (!canSelectSessionAction(this._runtimeActivity())) {
 			this._postCompactionContinuationScheduled = false;
 			this._schedulePostCompactionContinue();
 			return;
@@ -8246,6 +8267,9 @@ export class AgentSession {
 		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
 		if (contextTokens === undefined) return false;
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
+			if (!this._claimThresholdCompactionMessage(assistantMessage)) {
+				return false;
+			}
 			if (
 				queueAutonomousContinuation &&
 				(await this._queueAutonomousContinuationForThresholdCompaction(assistantMessage))
@@ -8322,6 +8346,8 @@ export class AgentSession {
 	): Promise<boolean> {
 		// Any compaction consumes a pending model request and honors its instructions
 		// (overflow recovery can fire first and take the request with it).
+		const thresholdMessage = reason === "threshold" ? this._pendingThresholdCompactionMessage : undefined;
+		this._pendingThresholdCompactionMessage = undefined;
 		const pending = this._pendingRequestedCompaction;
 		this._pendingRequestedCompaction = undefined;
 		const customInstructions = pending?.customInstructions;
@@ -8423,6 +8449,9 @@ export class AgentSession {
 				return false;
 			}
 			if (error instanceof CompactionSkippedError) {
+				if (reason === "threshold" && thresholdMessage) {
+					this._skippedThresholdCompactionMessages.add(thresholdMessage);
+				}
 				this._endCompactionUnsuccessfully(
 					reason,
 					"skipped",

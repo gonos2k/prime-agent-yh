@@ -1022,6 +1022,72 @@ describe("AgentSession compaction characterization", () => {
 		expect(sessionInternals._postCompactionContinuationScheduled).toBe(true);
 	});
 
+	it("uses the canonical admission gate before post-compaction continuation", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as {
+			_schedulePostCompactionContinue(): void;
+			_cancelPostCompactionContinue(): void;
+			_postCompactionContinuationScheduled: boolean;
+			_userBashRunning: boolean;
+		};
+		const continueSpy = vi.spyOn(harness.session.agent, "continue").mockResolvedValue(undefined as never);
+
+		try {
+			internals._userBashRunning = true;
+			internals._schedulePostCompactionContinue();
+			await vi.advanceTimersByTimeAsync(100);
+
+			expect(continueSpy).not.toHaveBeenCalled();
+			expect(internals._postCompactionContinuationScheduled).toBe(true);
+
+			internals._userBashRunning = false;
+			await vi.advanceTimersByTimeAsync(100);
+
+			expect(continueSpy).toHaveBeenCalledTimes(1);
+			expect(internals._postCompactionContinuationScheduled).toBe(false);
+		} finally {
+			internals._userBashRunning = false;
+			internals._cancelPostCompactionContinue();
+		}
+	});
+
+	it("does not repeat a skipped threshold compaction for the same assistant result", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+		const assistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: 200_000,
+			timestamp: Date.now(),
+		});
+		harness.session.agent.state.messages = [assistant];
+		const runCompactionSpy = vi.spyOn(internals, "_runAutoCompaction");
+
+		await internals._checkCompaction(assistant);
+		expect(runCompactionSpy).toHaveBeenCalledTimes(1);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "threshold",
+			errorSeverity: "warning",
+			errorMessage: expect.stringContaining("Session is too short to compact"),
+		});
+
+		await internals._checkCompaction(assistant);
+		expect(runCompactionSpy).toHaveBeenCalledTimes(1);
+
+		const nextAssistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: 200_000,
+			timestamp: assistant.timestamp + 1,
+		});
+		await internals._checkCompaction(nextAssistant);
+		expect(runCompactionSpy).toHaveBeenCalledTimes(2);
+	});
+
 	it("records terminal post-compaction continuation failures instead of swallowing them", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({ persistSession: true });

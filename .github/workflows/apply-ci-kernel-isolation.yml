@@ -50,18 +50,10 @@ jobs:
 
           workflow = Path('.github/workflows/ci.yml')
           text = workflow.read_text()
-          anchor = '''          - name: coding-agent kernel
-            package: packages/coding-agent
-            command: npm run test:kernel
-            install_uv: true
-'''
-          replacement = anchor + '''          - name: coding-agent bootstrap kernel
-            package: packages/coding-agent
-            command: npm run test:kernel-bootstrap
-            install_uv: true
-'''
+          anchor = "          - name: coding-agent kernel\n            package: packages/coding-agent\n            command: npm run test:kernel\n            install_uv: true\n"
+          addition = "          - name: coding-agent bootstrap kernel\n            package: packages/coding-agent\n            command: npm run test:kernel-bootstrap\n            install_uv: true\n"
           assert text.count(anchor) == 1
-          workflow.write_text(text.replace(anchor, replacement, 1))
+          workflow.write_text(text.replace(anchor, anchor + addition, 1))
           PY
 
       - name: Install and validate

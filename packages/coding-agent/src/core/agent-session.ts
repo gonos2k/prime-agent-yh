@@ -1254,6 +1254,8 @@ export class AgentSession {
 	private _turnIntervalAutoRefinePending = false;
 	private _postCompactionContinuationScheduled = false;
 	private _postCompactionContinuationTimer: ReturnType<typeof setTimeout> | undefined;
+	private _postCompactionContinuationSettled: Promise<void> | undefined;
+	private _resolvePostCompactionContinuation: (() => void) | undefined;
 	private _postCompactionContinuationMessages: AgentMessage[] = [];
 	private _scheduledPostCompactionContinuationMessages: AgentMessage[] = [];
 	private _queuedAutonomousThresholdContinuations = new WeakMap<AssistantMessage, AgentMessage>();
@@ -6446,10 +6448,20 @@ export class AgentSession {
 			await this.agent.waitForIdle();
 			const agentEventQueue = this._agentEventQueue;
 			await agentEventQueue;
+			// A timer-scheduled post-compaction continuation is session work,
+			// even though it is not visible to the agent or input-pump idle checks.
+			// Await the logical continuation across timer reschedules so headless
+			// callers cannot tear the session down before the resumed turn starts.
+			const postCompactionContinuation = this._postCompactionContinuationSettled;
+			if (postCompactionContinuation) {
+				await postCompactionContinuation;
+				continue;
+			}
 			if (
 				pump === this._sessionInputPump &&
 				agentEventQueue === this._agentEventQueue &&
 				!this._sessionInputPumpRequested &&
+				!this._postCompactionContinuationScheduled &&
 				!this.agent.state.isStreaming &&
 				this.unfinishedActionCount === 0
 			) {
@@ -7200,6 +7212,13 @@ export class AgentSession {
 		}
 		this._postCompactionContinuationScheduled = false;
 		this._scheduledPostCompactionContinuationMessages = [];
+		this._settlePostCompactionContinuation();
+	}
+
+	private _settlePostCompactionContinuation(): void {
+		this._resolvePostCompactionContinuation?.();
+		this._resolvePostCompactionContinuation = undefined;
+		this._postCompactionContinuationSettled = undefined;
 	}
 
 	private _discardPendingAutoRefine(options: { cancelPostCompactionContinue?: boolean } = {}): void {
@@ -7298,6 +7317,11 @@ export class AgentSession {
 			return;
 		}
 		this._postCompactionContinuationScheduled = true;
+		if (!this._postCompactionContinuationSettled) {
+			this._postCompactionContinuationSettled = new Promise<void>((resolve) => {
+				this._resolvePostCompactionContinuation = resolve;
+			});
+		}
 		this._scheduledPostCompactionContinuationMessages = [...this._postCompactionContinuationMessages];
 		this._postCompactionContinuationTimer = setTimeout(() => {
 			this._postCompactionContinuationTimer = undefined;
@@ -7342,6 +7366,7 @@ export class AgentSession {
 				} else {
 					this._scheduledPostCompactionContinuationMessages = [];
 					this._scheduleAutoRefineAfterAgentEnd();
+					this._settlePostCompactionContinuation();
 				}
 			}
 			return;
@@ -7355,6 +7380,10 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : String(error);
 			if (message.includes("already processing")) {
 				this._schedulePostCompactionContinue();
+			}
+		} finally {
+			if (!this._postCompactionContinuationScheduled) {
+				this._settlePostCompactionContinuation();
 			}
 		}
 	}

@@ -1,13 +1,4 @@
-import {
-	chmodSync,
-	closeSync,
-	fsyncSync,
-	ftruncateSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	renameSync,
-} from "node:fs";
+import { chmodSync, closeSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { writeAllSync } from "../../utils/write-all-sync.js";

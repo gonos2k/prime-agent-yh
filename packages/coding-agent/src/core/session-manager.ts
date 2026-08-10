@@ -1474,11 +1474,39 @@ export class SessionManager {
 		}
 	}
 
+	private _rollbackFailedAppend(entry: SessionEntry, previousLeafId: string | null): void {
+		if (this.fileEntries.at(-1) === entry) {
+			this.fileEntries.pop();
+		} else {
+			this.fileEntries = this.fileEntries.filter((candidate) => candidate !== entry);
+		}
+		this.byId.delete(entry.id);
+		this.leafId = previousLeafId;
+
+		if (!this.persist || !this.sessionFile) return;
+		// A failed append may have left a torn JSONL tail. Rebuild the durable
+		// file from the restored in-memory entries before another append occurs.
+		this.flushed = false;
+		try {
+			this.flushNow();
+		} catch {
+			// Keep the old in-memory branch and force the next successful flush to
+			// rewrite. Atomic rewrites preserve the last known-good live file.
+			this.flushed = false;
+		}
+	}
+
 	private _appendEntry(entry: SessionEntry): void {
+		const previousLeafId = this.leafId;
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._persist(entry);
+		try {
+			this._persist(entry);
+		} catch (error) {
+			this._rollbackFailedAppend(entry, previousLeafId);
+			throw error;
+		}
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1595,7 +1623,7 @@ export class SessionManager {
 			throw new Error(`Assistant message entry ${targetId} not found`);
 		}
 
-		target.message.usage = cloneUsage(aggregateUsage);
+		const aggregateUsageCopy = cloneUsage(aggregateUsage);
 		const entry: ChildUsageAttributionEntry = {
 			type: "child_usage_attributed",
 			id: generateId(this.byId),
@@ -1606,7 +1634,10 @@ export class SessionManager {
 			aggregateUsage: cloneUsage(aggregateUsage),
 			...(origin ? { origin } : {}),
 		};
+		// Persist the attribution first. A failed append must not rewrite the
+		// parent assistant with usage that has no durable attribution record.
 		this._appendEntry(entry);
+		target.message.usage = aggregateUsageCopy;
 		return entry.id;
 	}
 
@@ -1798,25 +1829,17 @@ export class SessionManager {
 
 	private _appendEntryWithRollback(append: () => string): string {
 		const previousLeafId = this.leafId;
+		let entryId: string | undefined;
 		try {
-			const entryId = append();
+			entryId = append();
 			this.flushNow();
 			return entryId;
 		} catch (error) {
-			// The append indexes the entry before persisting it; undo exactly that.
-			if (this.leafId !== null && this.leafId !== previousLeafId) {
-				this.byId.delete(this.leafId);
-				this.fileEntries.pop();
-				this.leafId = previousLeafId;
-				// The failed append may have left a torn line on disk. Restore the file
-				// from the rolled-back entries now; if that also fails (e.g. the disk is
-				// still full), fall back to forcing the next persist to rewrite.
-				this.flushed = false;
-				try {
-					this.flushNow();
-				} catch {
-					this.flushed = false;
-				}
+			// _appendEntry already rolls back persistence failures. This wrapper
+			// only needs to undo an entry when the forced flush itself fails.
+			const entry = entryId ? this.byId.get(entryId) : undefined;
+			if (entry) {
+				this._rollbackFailedAppend(entry, previousLeafId);
 			}
 			throw error;
 		}

@@ -1,0 +1,73 @@
+name: Persist heartbeat watchdog regression logs
+
+on:
+  push:
+    branches:
+      - fix/heartbeat-dispatch-watchdog
+    paths:
+      - .github/workflows/persist-heartbeat-watchdog-test-logs.yml
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/heartbeat-dispatch-watchdog
+          fetch-depth: 0
+
+      - name: Apply corrected watchdog patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          staged = Path('.github/workflows/apply-heartbeat-watchdog.yml')
+          workflow = staged.read_text()
+          match = re.search(r"          python3 - <<'PY'\n(.*?)\n          PY\n", workflow, re.S)
+          if not match:
+              raise SystemExit('could not extract staged patch')
+          exec(compile(textwrap.dedent(match.group(1)), str(staged), 'exec'))
+
+          daemon = Path('packages/coding-agent/src/modes/daemon/daemon-mode.ts')
+          text = daemon.read_text()
+          old = '''\t\t\tawait session.followUp(runnableJob.prompt, undefined, {
+          \t\t\t\tresumeIfIdle: true,
+          \t\t\t\tsignal,
+          \t\t\t});'''
+          new = '''\t\t\tawait session.followUp(runnableJob.prompt, undefined, {
+          \t\t\t\tresumeIfIdle: true,
+          \t\t\t});'''
+          if text.count(old) != 1:
+              raise SystemExit('expected exactly one queued follow-up signal')
+          daemon.write_text(text.replace(old, new))
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Capture isolated test output
+        shell: bash
+        run: |
+          set +e
+          cd packages/coding-agent
+          timeout 90s npx vitest --run test/cron-jobs.test.ts -t "times out a hung dispatch" --reporter=verbose > ../../.github/cron-watchdog-test.log 2>&1
+          echo "EXIT=$?" >> ../../.github/cron-watchdog-test.log
+          timeout 90s npx vitest --run test/daemon-mode.test.ts -t "propagates cancellation into a directly accepted heartbeat turn" --reporter=verbose > ../../.github/daemon-watchdog-test.log 2>&1
+          echo "EXIT=$?" >> ../../.github/daemon-watchdog-test.log
+          set -e
+
+      - name: Commit logs
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f .github/cron-watchdog-test.log .github/daemon-watchdog-test.log
+          git commit -m "chore(ci): persist heartbeat watchdog regression logs"
+          git push origin HEAD:fix/heartbeat-dispatch-watchdog

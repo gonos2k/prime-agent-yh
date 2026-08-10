@@ -1,0 +1,688 @@
+name: Apply heartbeat dispatch watchdog
+
+on:
+  push:
+    branches:
+      - fix/heartbeat-dispatch-watchdog
+    paths:
+      - .github/workflows/apply-heartbeat-watchdog.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/heartbeat-dispatch-watchdog
+          fetch-depth: 0
+
+      - name: Bound scheduled-job dispatches
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          cron_path = Path("packages/coding-agent/src/core/cron-jobs.ts")
+          cron = cron_path.read_text()
+
+          old_hooks = '''export interface AgentCronDispatch {
+          \tid: string;
+          \tjob: AgentCronJob;
+          }
+
+          export interface AgentCronSchedulerHooks {
+          \trunJob: (job: AgentCronJob) => Promise<AgentCronJobRunResult | undefined>;
+          \tbeginDispatch?: (dispatch: AgentCronDispatch) => (() => void) | undefined;
+          \tnow?: () => Date;
+          \tonError?: (job: AgentCronJob, error: unknown) => void;
+          }
+          '''
+          new_hooks = '''export interface AgentCronDispatch {
+          \tid: string;
+          \tjob: AgentCronJob;
+          }
+
+          export interface AgentCronRunContext {
+          \tdispatchId: string;
+          \tsignal: AbortSignal;
+          \ttimeoutMs: number;
+          }
+
+          export interface AgentCronSchedulerHooks {
+          \trunJob: (job: AgentCronJob, context: AgentCronRunContext) => Promise<AgentCronJobRunResult | undefined>;
+          \trunTimeoutMs?: (job: AgentCronJob) => number;
+          \tbeginDispatch?: (dispatch: AgentCronDispatch) => (() => void) | undefined;
+          \tnow?: () => Date;
+          \tonError?: (job: AgentCronJob, error: unknown) => void;
+          }
+          '''
+          if cron.count(old_hooks) != 1:
+              raise SystemExit("expected scheduler hooks block")
+          cron = cron.replace(old_hooks, new_hooks)
+
+          old_constants = '''const MAX_TIMEOUT_MS = 2_147_483_647;
+          const ONE_SECOND_MS = 1000;
+          const ONE_MINUTE_MS = 60_000;
+          export const DEFAULT_HEARTBEAT_SCHEDULE = "every 5m";
+          '''
+          new_constants = '''const MAX_TIMEOUT_MS = 2_147_483_647;
+          const ONE_SECOND_MS = 1000;
+          const ONE_MINUTE_MS = 60_000;
+          export const DEFAULT_CRON_JOB_RUN_TIMEOUT_MS = 30 * ONE_MINUTE_MS;
+          export const DEFAULT_HEARTBEAT_SCHEDULE = "every 5m";
+          '''
+          if cron.count(old_constants) != 1:
+              raise SystemExit("expected cron constants block")
+          cron = cron.replace(old_constants, new_constants)
+
+          class_marker = 'export class AgentCronScheduler {'
+          timeout_class = '''export class AgentCronJobTimeoutError extends Error {
+          \tconstructor(
+          \t\treadonly jobId: string,
+          \t\treadonly timeoutMs: number,
+          \t) {
+          \t\tsuper(`Cron job ${jobId} timed out after ${timeoutMs} ms`);
+          \t\tthis.name = "AgentCronJobTimeoutError";
+          \t}
+          }
+
+          '''
+          if cron.count(class_marker) != 1:
+              raise SystemExit("expected scheduler class marker")
+          cron = cron.replace(class_marker, timeout_class + class_marker)
+
+          old_run = 'runResult = await this.hooks.runJob(job);'
+          new_run = 'runResult = await this.runJobWithDeadline(dispatch, job);'
+          if cron.count(old_run) != 1:
+              raise SystemExit("expected direct scheduled-job await")
+          cron = cron.replace(old_run, new_run)
+
+          schedule_marker = '''\tprivate scheduleNext(delayMs?: number): void {
+          '''
+          deadline_method = '''\tprivate async runJobWithDeadline(
+          \t\tdispatch: AgentCronDispatch,
+          \t\tjob: AgentCronJob,
+          \t): Promise<AgentCronJobRunResult | undefined> {
+          \t\tconst configuredTimeoutMs = this.hooks.runTimeoutMs?.(job) ?? DEFAULT_CRON_JOB_RUN_TIMEOUT_MS;
+          \t\tif (!Number.isFinite(configuredTimeoutMs) || configuredTimeoutMs <= 0) {
+          \t\t\tthrow new Error(`Cron job timeout must be a positive finite number: ${configuredTimeoutMs}`);
+          \t\t}
+          \t\tconst timeoutMs = Math.min(Math.max(1, Math.floor(configuredTimeoutMs)), MAX_TIMEOUT_MS);
+          \t\tconst controller = new AbortController();
+          \t\tconst timeoutError = new AgentCronJobTimeoutError(job.id, timeoutMs);
+          \t\tlet onAbort: (() => void) | undefined;
+          \t\tconst aborted = new Promise<never>((_, reject) => {
+          \t\t\tonAbort = () => {
+          \t\t\t\tconst reason = controller.signal.reason;
+          \t\t\t\treject(reason instanceof Error ? reason : timeoutError);
+          \t\t\t};
+          \t\t\tcontroller.signal.addEventListener("abort", onAbort, { once: true });
+          \t\t});
+          \t\tconst timer = setTimeout(() => controller.abort(timeoutError), timeoutMs);
+          \t\ttry {
+          \t\t\tconst run = Promise.resolve().then(() =>
+          \t\t\t\tthis.hooks.runJob(job, {
+          \t\t\t\t\tdispatchId: dispatch.id,
+          \t\t\t\t\tsignal: controller.signal,
+          \t\t\t\t\ttimeoutMs,
+          \t\t\t\t}),
+          \t\t\t);
+          \t\t\treturn await Promise.race([run, aborted]);
+          \t\t} finally {
+          \t\t\tclearTimeout(timer);
+          \t\t\tif (onAbort) controller.signal.removeEventListener("abort", onAbort);
+          \t\t}
+          \t}
+
+          '''
+          if cron.count(schedule_marker) != 1:
+              raise SystemExit("expected scheduleNext marker")
+          cron = cron.replace(schedule_marker, deadline_method + schedule_marker)
+          cron_path.write_text(cron)
+
+          daemon_path = Path("packages/coding-agent/src/modes/daemon/daemon-mode.ts")
+          daemon = daemon_path.read_text()
+          import_old = '''\ttype AgentCronJob,
+          \tAgentCronJobStore,
+          \tAgentCronScheduler,
+          '''
+          import_new = '''\ttype AgentCronJob,
+          \ttype AgentCronRunContext,
+          \tAgentCronJobStore,
+          \tAgentCronScheduler,
+          '''
+          if daemon.count(import_old) != 1:
+              raise SystemExit("expected cron import block")
+          daemon = daemon.replace(import_old, import_new)
+
+          constructor_old = '\t\t\trunJob: (job) => this.runCronJob(job),'
+          constructor_new = '\t\t\trunJob: (job, context) => this.runCronJob(job, context),'
+          if daemon.count(constructor_old) != 1:
+              raise SystemExit("expected daemon scheduler hook")
+          daemon = daemon.replace(constructor_old, constructor_new)
+
+          session_pattern = re.compile(
+              r'\tprivate async getOrCreateCronJobSession\(.*?\n\tprivate cancelRlmHeartbeat\(jobId: string\): void \{',
+              re.S,
+          )
+          session_replacement = '''\tprivate async getOrCreateCronJobSession(
+          \t\tjob: AgentCronJob,
+          \t\trequirePersistedJob: boolean,
+          \t\tsignal?: AbortSignal,
+          \t): Promise<ActiveSessionState | undefined> {
+          \t\tif (signal?.aborted) {
+          \t\t\treturn undefined;
+          \t\t}
+          \t\tconst dueJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : job;
+          \t\tif (!dueJob) {
+          \t\t\treturn undefined;
+          \t\t}
+          \t\tconst activeIdMatch = this.sessions.get(dueJob.activeSessionId);
+          \t\tconst current =
+          \t\t\tthis.findSessionBySessionFile(dueJob.sessionFile) ??
+          \t\t\t(!requirePersistedJob || activeIdMatch?.runtime.session.sessionId === dueJob.sessionId
+          \t\t\t\t? activeIdMatch
+          \t\t\t\t: undefined);
+          \t\tconst requiresRlmSubagentRestore =
+          \t\t\tdueJob.source === "rlm_heartbeat" &&
+          \t\t\tdueJob.runtimeKind === "subagent" &&
+          \t\t\tcurrent?.runtime.metadata.kind !== "subagent";
+          \t\t// A half-bound match falls through to createRuntime, which awaits the
+          \t\t// pending create for the same session file instead of prompting mid-bind.
+          \t\tif (current && !this.bindingSessions.has(current.activeSessionId) && !requiresRlmSubagentRestore) {
+          \t\t\tthis.rebindCronJobsToState(current);
+          \t\t\tconst reboundJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : dueJob;
+          \t\t\treturn reboundJob && this.isCronJobRunnableForState(reboundJob, current, requirePersistedJob)
+          \t\t\t\t? current
+          \t\t\t\t: undefined;
+          \t\t}
+          \t\tif (!requirePersistedJob) {
+          \t\t\treturn undefined;
+          \t\t}
+          \t\tif (dueJob.source === "rlm_heartbeat" && dueJob.runtimeKind === "subagent") {
+          \t\t\tif (current && this.bindingSessions.has(current.activeSessionId)) {
+          \t\t\t\treturn undefined;
+          \t\t\t}
+          \t\t\treturn this.restoreRlmHeartbeatSession(dueJob, signal);
+          \t\t}
+          \t\tif (signal?.aborted || !(await this.isPersistedCronJobRunnable(dueJob.id))) {
+          \t\t\treturn undefined;
+          \t\t}
+          \t\ttry {
+          \t\t\tconst opening = this.createRuntime({ type: "create", sessionPath: dueJob.sessionFile }, async () =>
+          \t\t\t\t!signal?.aborted && (await this.isPersistedCronJobRunnable(dueJob.id)),
+          \t\t\t);
+          \t\t\treturn signal ? await waitForPromptAdmission(opening, signal) : await opening;
+          \t\t} catch (error) {
+          \t\t\tif (error instanceof RuntimeOpenCancelledError || error instanceof PromptAdmissionCancelledError) {
+          \t\t\t\treturn undefined;
+          \t\t\t}
+          \t\t\tthrow error;
+          \t\t}
+          \t}
+
+          \tprivate async restoreRlmHeartbeatSession(
+          \t\tjob: AgentCronJob,
+          \t\tsignal?: AbortSignal,
+          \t): Promise<ActiveSessionState | undefined> {
+          \t\tif (signal?.aborted) {
+          \t\t\treturn undefined;
+          \t\t}
+          \t\tconst childInfo = await readSessionInfo(job.sessionFile);
+          \t\tconst parentSessionPath = childInfo?.parentSessionPath;
+          \t\tconst parentInfo = parentSessionPath ? await readSessionInfo(parentSessionPath) : undefined;
+          \t\tif (
+          \t\t\t!childInfo ||
+          \t\t\tchildInfo.id !== job.sessionId ||
+          \t\t\t!parentSessionPath ||
+          \t\t\t!parentInfo ||
+          \t\t\tparentInfo.state?.status !== "active"
+          \t\t) {
+          \t\t\tthis.cancelRlmHeartbeat(job.id);
+          \t\t\treturn undefined;
+          \t\t}
+
+          \t\ttry {
+          \t\t\tconst residentChild = this.findSessionBySessionFile(job.sessionFile);
+          \t\t\tconst parentOpening = this.createRuntime(
+          \t\t\t\t{ type: "create", sessionPath: parentSessionPath },
+          \t\t\t\t() => !signal?.aborted && this.getRunnableCronJob(job.id) !== undefined,
+          \t\t\t);
+          \t\t\tif (signal) {
+          \t\t\t\tawait waitForPromptAdmission(parentOpening, signal);
+          \t\t\t} else {
+          \t\t\t\tawait parentOpening;
+          \t\t\t}
+          \t\t\tif (signal?.aborted) {
+          \t\t\t\treturn undefined;
+          \t\t\t}
+          \t\t\tconst passiveLookup = this.findPassiveRlmSubagent(
+          \t\t\t\tjob.sessionFile,
+          \t\t\t\tresidentChild !== undefined && residentChild.runtime.metadata.kind !== "subagent",
+          \t\t\t);
+          \t\t\tconst passiveSubagent = signal
+          \t\t\t\t? await waitForPromptAdmission(passiveLookup, signal)
+          \t\t\t\t: await passiveLookup;
+          \t\t\tconst resident = this.findSessionBySessionFile(job.sessionFile);
+          \t\t\tlet childState: ActiveSessionState | undefined;
+          \t\t\tif (passiveSubagent) {
+          \t\t\t\tconst hydration = this.hydratePassiveRlmSubagent(passiveSubagent);
+          \t\t\t\tchildState = signal ? await waitForPromptAdmission(hydration, signal) : await hydration;
+          \t\t\t} else if (resident) {
+          \t\t\t\tconst binding = this.waitForBoundSession(resident);
+          \t\t\t\tchildState = signal ? await waitForPromptAdmission(binding, signal) : await binding;
+          \t\t\t}
+          \t\t\tif (signal?.aborted) {
+          \t\t\t\treturn undefined;
+          \t\t\t}
+          \t\t\tif (passiveSubagent && childState && this.getRunnableCronJob(job.id) === undefined) {
+          \t\t\t\tthrow new RuntimeOpenCancelledError();
+          \t\t\t}
+          \t\t\tif (!childState || childState.runtime.metadata.kind !== "subagent") {
+          \t\t\t\tthis.cancelRlmHeartbeat(job.id);
+          \t\t\t\treturn undefined;
+          \t\t\t}
+          \t\t\tthis.rebindCronJobsToState(childState);
+          \t\t\tconst reboundJob = this.getRunnableCronJob(job.id);
+          \t\t\treturn reboundJob && this.isCronJobRunnableForState(reboundJob, childState, true)
+          \t\t\t\t? childState
+          \t\t\t\t: undefined;
+          \t\t} catch (error) {
+          \t\t\tif (
+          \t\t\t\terror instanceof RuntimeOpenCancelledError ||
+          \t\t\t\terror instanceof BoundSessionUnavailableError ||
+          \t\t\t\terror instanceof PromptAdmissionCancelledError
+          \t\t\t) {
+          \t\t\t\treturn undefined;
+          \t\t\t}
+          \t\t\tthrow error;
+          \t\t}
+          \t}
+
+          \tprivate cancelRlmHeartbeat(jobId: string): void {'''
+          daemon, count = session_pattern.subn(session_replacement, daemon, count=1)
+          if count != 1:
+              raise SystemExit("expected cron session acquisition block")
+
+          run_pattern = re.compile(
+              r'\tprivate async runCronJob\(job: AgentCronJob\): Promise<"skipped" \| undefined> \{.*?\n\t\}\n\n\tprivate getRunnableCronJob',
+              re.S,
+          )
+          run_replacement = '''\tprivate async runCronJob(
+          \t\tjob: AgentCronJob,
+          \t\tcontext: AgentCronRunContext,
+          \t): Promise<"skipped" | undefined> {
+          \t\tconst { signal } = context;
+          \t\tif (signal.aborted) {
+          \t\t\treturn "skipped";
+          \t\t}
+          \t\tconst requirePersistedJob = this.cronStore.list().some((candidate) => candidate.id === job.id);
+          \t\tconst dueJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : job;
+          \t\tif (!dueJob) {
+          \t\t\treturn "skipped";
+          \t\t}
+          \t\tconst state = await this.getOrCreateCronJobSession(dueJob, requirePersistedJob, signal);
+          \t\tconst runnableJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : dueJob;
+          \t\tif (
+          \t\t\tsignal.aborted ||
+          \t\t\t!state ||
+          \t\t\t!runnableJob ||
+          \t\t\t!this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)
+          \t\t) {
+          \t\t\treturn "skipped";
+          \t\t}
+          \t\tconst session = state.runtime.session;
+          \t\tconst isAgentMessagePromptInProgress =
+          \t\t\tthis.agentMessageAcceptingTargets.has(state.activeSessionId) ||
+          \t\t\tthis.agentMessagePreparingTargets.has(state.activeSessionId);
+          \t\tif (isHeartbeatCronJob(runnableJob) && isAgentMessagePromptInProgress) {
+          \t\t\treturn "skipped";
+          \t\t}
+          \t\tif (shouldDeferHeartbeatCronJob(runnableJob, session)) {
+          \t\t\treturn "skipped";
+          \t\t}
+          \t\tconst shouldQueueCronPrompt =
+          \t\t\tisAgentMessagePromptInProgress ||
+          \t\t\tsession.isStreaming ||
+          \t\t\tsession.isCompacting ||
+          \t\t\tsession.isRetrying ||
+          \t\t\tsession.isBashRunning ||
+          \t\t\tsession.unfinishedActionCount > 0;
+          \t\tif (!isHeartbeatCronJob(runnableJob) && shouldQueueCronPrompt) {
+          \t\t\tif (signal.aborted || !this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
+          \t\t\t\treturn "skipped";
+          \t\t\t}
+          \t\t\tawait session.followUp(runnableJob.prompt, undefined, {
+          \t\t\t\tresumeIfIdle: true,
+          \t\t\t\tsignal,
+          \t\t\t});
+          \t\t\treturn;
+          \t\t}
+          \t\tconst getRunnableJob = (): AgentCronJob | undefined => {
+          \t\t\tconst current = requirePersistedJob ? this.getRunnableCronJob(job.id) : runnableJob;
+          \t\t\treturn current && this.isCronJobRunnableForState(current, state, requirePersistedJob) ? current : undefined;
+          \t\t};
+          \t\tif (isHeartbeatCronJob(runnableJob)) {
+          \t\t\tconst streamingBehavior = resolveHeartbeatStreamingBehavior(runnableJob.deliveryMode);
+          \t\t\tconst didPrompt = await this.withCronPromptAbort(state, signal, (abortOptions) =>
+          \t\t\t\tthis.promptHeartbeatWithAgentMessagePreparingGuard(
+          \t\t\t\t\tstate,
+          \t\t\t\t\trunnableJob,
+          \t\t\t\t\t{
+          \t\t\t\t\t\tstreamingBehavior,
+          \t\t\t\t\t\tfollowUpQueueKey: `heartbeat:${runnableJob.id}`,
+          \t\t\t\t\t\tsource: "rpc",
+          \t\t\t\t\t\t...abortOptions,
+          \t\t\t\t\t},
+          \t\t\t\t\tgetRunnableJob,
+          \t\t\t\t),
+          \t\t\t);
+          \t\t\treturn didPrompt ? undefined : "skipped";
+          \t\t}
+          \t\tconst canPrompt = () => getRunnableJob() !== undefined;
+          \t\tconst didPrompt = await this.withCronPromptAbort(state, signal, (abortOptions) =>
+          \t\t\tthis.promptWithAgentMessagePreparingGuard(
+          \t\t\t\tstate,
+          \t\t\t\trunnableJob.prompt,
+          \t\t\t\t{
+          \t\t\t\t\tstreamingBehavior: "followUp",
+          \t\t\t\t\tsource: "rpc",
+          \t\t\t\t\t...abortOptions,
+          \t\t\t\t},
+          \t\t\t\tcanPrompt,
+          \t\t\t\tfalse,
+          \t\t\t),
+          \t\t);
+          \t\treturn didPrompt ? undefined : "skipped";
+          \t}
+
+          \tprivate async withCronPromptAbort<T>(
+          \t\tstate: ActiveSessionState,
+          \t\tsignal: AbortSignal,
+          \t\trun: (options: Pick<PromptOptions, "signal" | "preflightResult">) => Promise<T>,
+          \t): Promise<T> {
+          \t\tlet directTurnAccepted = false;
+          \t\tconst onAbort = () => {
+          \t\t\tif (directTurnAccepted) {
+          \t\t\t\tstate.runtime.session.requestAbort();
+          \t\t\t}
+          \t\t};
+          \t\tsignal.addEventListener("abort", onAbort);
+          \t\ttry {
+          \t\t\treturn await run({
+          \t\t\t\tsignal,
+          \t\t\t\tpreflightResult: (didSucceed, queued) => {
+          \t\t\t\t\tdirectTurnAccepted = didSucceed && queued !== true;
+          \t\t\t\t},
+          \t\t\t});
+          \t\t} finally {
+          \t\t\tsignal.removeEventListener("abort", onAbort);
+          \t\t}
+          \t}
+
+          \tprivate getRunnableCronJob'''
+          daemon, count = run_pattern.subn(run_replacement, daemon, count=1)
+          if count != 1:
+              raise SystemExit("expected runCronJob block")
+
+          old_heartbeat_preflight = '''\t\t\t\t\tpreflightResult: (didSucceed) => {
+          \t\t\t\t\t\tif (didSucceed && session.isStreaming) {
+          \t\t\t\t\t\t\tclearPreparing();
+          \t\t\t\t\t\t}
+          \t\t\t\t\t\toptions?.preflightResult?.(didSucceed);
+          \t\t\t\t\t},
+          '''
+          new_heartbeat_preflight = '''\t\t\t\t\tpreflightResult: (didSucceed, queued) => {
+          \t\t\t\t\t\tif (didSucceed && session.isStreaming) {
+          \t\t\t\t\t\t\tclearPreparing();
+          \t\t\t\t\t\t}
+          \t\t\t\t\t\toptions?.preflightResult?.(didSucceed, queued);
+          \t\t\t\t\t},
+          '''
+          if daemon.count(old_heartbeat_preflight) != 1:
+              raise SystemExit("expected heartbeat preflight wrapper")
+          daemon = daemon.replace(old_heartbeat_preflight, new_heartbeat_preflight)
+
+          old_guard_tail = '''\t\t\t},
+          \t\t);
+          \t}
+
+          \tprivate async withAgentMessagePreparingGuard(
+          '''
+          new_guard_tail = '''\t\t\t},
+          \t\t\toptions?.signal,
+          \t\t);
+          \t}
+
+          \tprivate async withAgentMessagePreparingGuard(
+          '''
+          if daemon.count(old_guard_tail) < 1:
+              raise SystemExit("expected heartbeat guard tail")
+          # Only the occurrence immediately preceding withAgentMessagePreparingGuard belongs to promptHeartbeat.
+          daemon = daemon.replace(old_guard_tail, new_guard_tail, 1)
+          daemon_path.write_text(daemon)
+
+          cron_test_path = Path("packages/coding-agent/test/cron-jobs.test.ts")
+          cron_tests = cron_test_path.read_text()
+          marker = '\n});\n\ndescribe("shouldDeferHeartbeatCronJob", () => {'
+          if cron_tests.count(marker) != 1:
+              raise SystemExit("expected scheduler test boundary")
+          watchdog_test = r'''
+
+          	it("times out a hung dispatch, aborts it, and releases the same-session lane", async () => {
+          		vi.useFakeTimers();
+          		try {
+          			const store = new AgentCronJobStore(makeStorePath(tempDirs));
+          			const first = store.create({
+          				activeSessionId: "active-watchdog",
+          				sessionId: "session-watchdog",
+          				sessionFile: "/tmp/session-watchdog.jsonl",
+          				cwd: "/tmp/project",
+          				scheduleText: "in 1m",
+          				prompt: "first",
+          				now: start,
+          			});
+          			const second = store.create({
+          				activeSessionId: "active-watchdog",
+          				sessionId: "session-watchdog",
+          				sessionFile: "/tmp/session-watchdog.jsonl",
+          				cwd: "/tmp/project",
+          				scheduleText: "in 1m",
+          				prompt: "second",
+          				now: start,
+          			});
+          			const started: string[] = [];
+          			let firstSignal: AbortSignal | undefined;
+          			let releaseFirst: () => void = () => {};
+          			const onError = vi.fn();
+          			const scheduler = new AgentCronScheduler(store, {
+          				now: () => new Date("2026-01-01T12:35:00.000Z"),
+          				runTimeoutMs: () => 1_000,
+          				runJob: async (job, context) => {
+          					started.push(job.prompt);
+          					if (job.id === first.id) {
+          						firstSignal = context.signal;
+          						await new Promise<void>((resolve) => {
+          							releaseFirst = resolve;
+          						});
+          					}
+          					return undefined;
+          				},
+          				onError,
+          			});
+
+          			const run = scheduler.runDue(new Date("2026-01-01T12:35:00.000Z"));
+          			await Promise.resolve();
+          			await Promise.resolve();
+          			expect(started).toEqual(["first"]);
+
+          			await vi.advanceTimersByTimeAsync(1_000);
+          			await expect(run).resolves.toBe(2);
+
+          			expect(firstSignal?.aborted).toBe(true);
+          			expect(started).toEqual(["first", "second"]);
+          			expect(onError).toHaveBeenCalledOnce();
+          			expect(store.list().find((job) => job.id === first.id)).toMatchObject({
+          				status: "completed",
+          				runCount: 1,
+          				lastError: `Cron job ${first.id} timed out after 1000 ms`,
+          			});
+          			expect(store.list().find((job) => job.id === second.id)).toMatchObject({
+          				status: "completed",
+          				runCount: 1,
+          			});
+
+          			const timedOutState = structuredClone(store.list().find((job) => job.id === first.id));
+          			releaseFirst();
+          			await Promise.resolve();
+          			await Promise.resolve();
+          			expect(store.list().find((job) => job.id === first.id)).toEqual(timedOutState);
+          		} finally {
+          			vi.useRealTimers();
+          		}
+          	});
+          '''
+          cron_tests = cron_tests.replace(marker, watchdog_test + marker)
+          cron_test_path.write_text(cron_tests)
+
+          daemon_test_path = Path("packages/coding-agent/test/daemon-mode.test.ts")
+          daemon_tests = daemon_test_path.read_text()
+          if 'describe("daemon scheduled-job watchdog"' in daemon_tests:
+              raise SystemExit("daemon watchdog tests already exist")
+          daemon_tests += r'''
+
+          describe("daemon scheduled-job watchdog", () => {
+          	it("propagates cancellation into a directly accepted heartbeat turn", async () => {
+          		const daemon = new AgentDaemon("/tmp/prime-agent-watchdog.sock", {
+          			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+          			createRuntime: vi.fn(),
+          		});
+          		const state = makeState("active-watchdog");
+          		const requestAbort = vi.fn();
+          		let capturedSignal: AbortSignal | undefined;
+          		const promptHeartbeat = vi.fn(
+          			(
+          				_job: AgentCronJob,
+          				options?: {
+          					signal?: AbortSignal;
+          					preflightResult?: (didSucceed: boolean, queued?: boolean) => void;
+          				},
+          			) => {
+          				capturedSignal = options?.signal;
+          				options?.preflightResult?.(true, false);
+          				return new Promise<void>((_, reject) => {
+          					options?.signal?.addEventListener(
+          						"abort",
+          						() => {
+          							const reason = options.signal?.reason;
+          							reject(reason instanceof Error ? reason : new Error("heartbeat aborted"));
+          						},
+          						{ once: true },
+          					);
+          				});
+          			},
+          		);
+          		state.runtime = {
+          			...state.runtime,
+          			cwd: "/tmp",
+          			metadata: { kind: "top-level", createdAt: 1 },
+          			session: {
+          				sessionId: "session-watchdog",
+          				sessionFile: "/tmp/session-watchdog.jsonl",
+          				isStreaming: false,
+          				isCompacting: false,
+          				isRetrying: false,
+          				isBashRunning: false,
+          				hasPendingSessionWork: false,
+          				unfinishedActionCount: 0,
+          				promptHeartbeat,
+          				requestAbort,
+          			},
+          		} as never;
+          		const job: AgentCronJob = {
+          			id: "heartbeat-watchdog",
+          			status: "active",
+          			source: "heartbeat",
+          			runtimeKind: "top-level",
+          			activeSessionId: state.activeSessionId,
+          			sessionId: "session-watchdog",
+          			sessionFile: "/tmp/session-watchdog.jsonl",
+          			cwd: "/tmp",
+          			prompt: "check progress",
+          			schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+          			createdAt: "2026-01-01T00:00:00.000Z",
+          			updatedAt: "2026-01-01T00:00:00.000Z",
+          			nextRunAt: "2026-01-01T00:05:00.000Z",
+          			runCount: 0,
+          		};
+          		const internals = daemon as unknown as {
+          			sessions: Map<string, ActiveSessionState>;
+          			cronStore: { list(): AgentCronJob[] };
+          			getOrCreateCronJobSession(
+          				job: AgentCronJob,
+          				requirePersistedJob: boolean,
+          				signal?: AbortSignal,
+          			): Promise<ActiveSessionState | undefined>;
+          			getRunnableCronJob(jobId: string): AgentCronJob | undefined;
+          			isCronJobRunnableForState(
+          				job: AgentCronJob,
+          				state: ActiveSessionState,
+          				requirePersistedJob: boolean,
+          			): boolean;
+          			runCronJob(
+          				job: AgentCronJob,
+          				context: { dispatchId: string; signal: AbortSignal; timeoutMs: number },
+          			): Promise<"skipped" | undefined>;
+          		};
+          		internals.sessions.set(state.activeSessionId, state);
+          		vi.spyOn(internals.cronStore, "list").mockReturnValue([job]);
+          		vi.spyOn(internals, "getOrCreateCronJobSession").mockResolvedValue(state);
+          		vi.spyOn(internals, "getRunnableCronJob").mockReturnValue(job);
+          		vi.spyOn(internals, "isCronJobRunnableForState").mockReturnValue(true);
+          		const controller = new AbortController();
+
+          		const run = internals.runCronJob(job, {
+          			dispatchId: "dispatch-watchdog",
+          			signal: controller.signal,
+          			timeoutMs: 1_000,
+          		});
+          		await Promise.resolve();
+          		await Promise.resolve();
+          		expect(capturedSignal).toBe(controller.signal);
+
+          		controller.abort(new Error("watchdog timeout"));
+
+          		await expect(run).rejects.toThrow("watchdog timeout");
+          		expect(requestAbort).toHaveBeenCalledOnce();
+          	});
+          });
+          '''
+          daemon_test_path.write_text(daemon_tests)
+          PY
+          rm .github/workflows/apply-heartbeat-watchdog.yml
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and check
+        run: |
+          npm run build
+          npm run check
+
+      - name: Run watchdog regression tests
+        working-directory: packages/coding-agent
+        run: npx vitest --run test/cron-jobs.test.ts test/daemon-mode.test.ts
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/coding-agent/src/core/cron-jobs.ts packages/coding-agent/src/modes/daemon/daemon-mode.ts packages/coding-agent/test/cron-jobs.test.ts packages/coding-agent/test/daemon-mode.test.ts .github/workflows/apply-heartbeat-watchdog.yml
+          git commit -m "fix(coding-agent): bound scheduled-job dispatches"
+          git push origin HEAD:fix/heartbeat-dispatch-watchdog

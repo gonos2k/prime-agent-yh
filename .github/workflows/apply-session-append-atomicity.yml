@@ -1,0 +1,252 @@
+name: Apply session append atomicity patch
+
+on:
+  push:
+    branches:
+      - fix/session-manager-append-atomicity
+    paths:
+      - .github/workflows/apply-session-append-atomicity.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/session-manager-append-atomicity
+          fetch-depth: 0
+
+      - name: Make session appends transactional
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source_path = Path("packages/coding-agent/src/core/session-manager.ts")
+          text = source_path.read_text()
+
+          old_append = '''\tprivate _appendEntry(entry: SessionEntry): void {
+          \t\tthis.fileEntries.push(entry);
+          \t\tthis.byId.set(entry.id, entry);
+          \t\tthis.leafId = entry.id;
+          \t\tthis._persist(entry);
+          \t}
+          '''
+          new_append = '''\tprivate _rollbackFailedAppend(entry: SessionEntry, previousLeafId: string | null): void {
+          \t\tif (this.fileEntries.at(-1) === entry) {
+          \t\t\tthis.fileEntries.pop();
+          \t\t} else {
+          \t\t\tthis.fileEntries = this.fileEntries.filter((candidate) => candidate !== entry);
+          \t\t}
+          \t\tthis.byId.delete(entry.id);
+          \t\tthis.leafId = previousLeafId;
+
+          \t\tif (!this.persist || !this.sessionFile) return;
+          \t\t// A failed append may have left a torn JSONL tail. Rebuild the durable
+          \t\t// file from the restored in-memory entries before another append occurs.
+          \t\tthis.flushed = false;
+          \t\ttry {
+          \t\t\tthis.flushNow();
+          \t\t} catch {
+          \t\t\t// Keep the old in-memory branch and force the next successful flush to
+          \t\t\t// rewrite. Atomic rewrites preserve the last known-good live file.
+          \t\t\tthis.flushed = false;
+          \t\t}
+          \t}
+
+          \tprivate _appendEntry(entry: SessionEntry): void {
+          \t\tconst previousLeafId = this.leafId;
+          \t\tthis.fileEntries.push(entry);
+          \t\tthis.byId.set(entry.id, entry);
+          \t\tthis.leafId = entry.id;
+          \t\ttry {
+          \t\t\tthis._persist(entry);
+          \t\t} catch (error) {
+          \t\t\tthis._rollbackFailedAppend(entry, previousLeafId);
+          \t\t\tthrow error;
+          \t\t}
+          \t}
+          '''
+          if text.count(old_append) != 1:
+              raise SystemExit("expected exactly one _appendEntry implementation")
+          text = text.replace(old_append, new_append)
+
+          old_usage = '''\t\ttarget.message.usage = cloneUsage(aggregateUsage);
+          \t\tconst entry: ChildUsageAttributionEntry = {
+          \t\t\ttype: "child_usage_attributed",
+          \t\t\tid: generateId(this.byId),
+          \t\t\tparentId: this.leafId,
+          \t\t\ttimestamp: new Date().toISOString(),
+          \t\t\ttargetId,
+          \t\t\tchildUsage: cloneUsage(childUsage),
+          \t\t\taggregateUsage: cloneUsage(aggregateUsage),
+          \t\t\t...(origin ? { origin } : {}),
+          \t\t};
+          \t\tthis._appendEntry(entry);
+          \t\treturn entry.id;
+          '''
+          new_usage = '''\t\tconst aggregateUsageCopy = cloneUsage(aggregateUsage);
+          \t\tconst entry: ChildUsageAttributionEntry = {
+          \t\t\ttype: "child_usage_attributed",
+          \t\t\tid: generateId(this.byId),
+          \t\t\tparentId: this.leafId,
+          \t\t\ttimestamp: new Date().toISOString(),
+          \t\t\ttargetId,
+          \t\t\tchildUsage: cloneUsage(childUsage),
+          \t\t\taggregateUsage: cloneUsage(aggregateUsage),
+          \t\t\t...(origin ? { origin } : {}),
+          \t\t};
+          \t\t// Persist the attribution first. A failed append must not rewrite the
+          \t\t// parent assistant with usage that has no durable attribution record.
+          \t\tthis._appendEntry(entry);
+          \t\ttarget.message.usage = aggregateUsageCopy;
+          \t\treturn entry.id;
+          '''
+          if text.count(old_usage) != 1:
+              raise SystemExit("expected exactly one child usage append block")
+          text = text.replace(old_usage, new_usage)
+
+          old_wrapper = '''\tprivate _appendEntryWithRollback(append: () => string): string {
+          \t\tconst previousLeafId = this.leafId;
+          \t\ttry {
+          \t\t\tconst entryId = append();
+          \t\t\tthis.flushNow();
+          \t\t\treturn entryId;
+          \t\t} catch (error) {
+          \t\t\t// The append indexes the entry before persisting it; undo exactly that.
+          \t\t\tif (this.leafId !== null && this.leafId !== previousLeafId) {
+          \t\t\t\tthis.byId.delete(this.leafId);
+          \t\t\t\tthis.fileEntries.pop();
+          \t\t\t\tthis.leafId = previousLeafId;
+          \t\t\t\t// The failed append may have left a torn line on disk. Restore the file
+          \t\t\t\t// from the rolled-back entries now; if that also fails (e.g. the disk is
+          \t\t\t\t// still full), fall back to forcing the next persist to rewrite.
+          \t\t\t\tthis.flushed = false;
+          \t\t\t\ttry {
+          \t\t\t\t\tthis.flushNow();
+          \t\t\t\t} catch {
+          \t\t\t\t\tthis.flushed = false;
+          \t\t\t\t}
+          \t\t\t}
+          \t\t\tthrow error;
+          \t\t}
+          \t}
+          '''
+          new_wrapper = '''\tprivate _appendEntryWithRollback(append: () => string): string {
+          \t\tconst previousLeafId = this.leafId;
+          \t\tlet entryId: string | undefined;
+          \t\ttry {
+          \t\t\tentryId = append();
+          \t\t\tthis.flushNow();
+          \t\t\treturn entryId;
+          \t\t} catch (error) {
+          \t\t\t// _appendEntry already rolls back persistence failures. This wrapper
+          \t\t\t// only needs to undo an entry when the forced flush itself fails.
+          \t\t\tconst entry = entryId ? this.byId.get(entryId) : undefined;
+          \t\t\tif (entry) {
+          \t\t\t\tthis._rollbackFailedAppend(entry, previousLeafId);
+          \t\t\t}
+          \t\t\tthrow error;
+          \t\t}
+          \t}
+          '''
+          if text.count(old_wrapper) != 1:
+              raise SystemExit("expected exactly one rollback wrapper")
+          text = text.replace(old_wrapper, new_wrapper)
+          source_path.write_text(text)
+
+          test_path = Path("packages/coding-agent/test/session-manager-flush.test.ts")
+          tests = test_path.read_text()
+          marker = 'describe("SessionManager transactional appends", () => {'
+          if marker in tests:
+              raise SystemExit("transactional append tests already exist")
+          tests += r'''
+
+          describe("SessionManager transactional appends", () => {
+          	it("rolls back an ordinary message and repairs a torn JSONL tail", () => {
+          		const { mgr, file, before } = createPersistedSessionForRollbackTest();
+          		const previousLeafId = mgr.getLeafId();
+          		const previousEntryCount = mgr.getEntries().length;
+          		failNextOutcomeAppend(mgr, file);
+
+          		expect(() =>
+          			mgr.appendMessage({ role: "user", content: "not durable", timestamp: Date.now() }),
+          		).toThrow("append failed");
+
+          		expect(mgr.getLeafId()).toBe(previousLeafId);
+          		expect(mgr.getEntries()).toHaveLength(previousEntryCount);
+          		expect(readFileSync(file)).toEqual(before);
+          	});
+
+          	it("does not expose aggregate child usage without a durable attribution", () => {
+          		const { mgr, file, before } = createPersistedSessionForRollbackTest();
+          		const target = mgr.getLeafEntry();
+          		if (!target || target.type !== "message" || target.message.role !== "assistant") {
+          			throw new Error("expected assistant leaf");
+          		}
+          		const originalUsage = structuredClone(target.message.usage);
+          		const previousLeafId = mgr.getLeafId();
+          		failNextOutcomeAppend(mgr, file);
+
+          		expect(() =>
+          			mgr.appendChildUsageAttribution(
+          				target.id,
+          				{
+          					input: 2,
+          					output: 3,
+          					cacheRead: 0,
+          					cacheWrite: 0,
+          					totalTokens: 5,
+          					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          				},
+          				{
+          					input: 3,
+          					output: 4,
+          					cacheRead: 0,
+          					cacheWrite: 0,
+          					totalTokens: 7,
+          					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          				},
+          			),
+          		).toThrow("append failed");
+
+          		const restored = mgr.getEntry(target.id);
+          		expect(restored?.type).toBe("message");
+          		if (!restored || restored.type !== "message" || restored.message.role !== "assistant") {
+          			throw new Error("expected restored assistant entry");
+          		}
+          		expect(restored.message.usage).toEqual(originalUsage);
+          		expect(mgr.getLeafId()).toBe(previousLeafId);
+          		expect(mgr.getEntries().some((entry) => entry.type === "child_usage_attributed")).toBe(false);
+          		expect(readFileSync(file)).toEqual(before);
+          	});
+          });
+          '''
+          test_path.write_text(tests)
+          PY
+          rm .github/workflows/apply-session-append-atomicity.yml
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and check
+        run: |
+          npm run build
+          npm run check
+
+      - name: Run session persistence regression tests
+        working-directory: packages/coding-agent
+        run: npx vitest --run test/session-manager-flush.test.ts
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/coding-agent/src/core/session-manager.ts packages/coding-agent/test/session-manager-flush.test.ts .github/workflows/apply-session-append-atomicity.yml
+          git commit -m "fix(coding-agent): make session appends transactional"
+          git push origin HEAD:fix/session-manager-append-atomicity

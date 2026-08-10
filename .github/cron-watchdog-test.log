@@ -1,0 +1,82 @@
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.9 [39m[90m/home/runner/work/prime-agent-yh/prime-agent-yh/packages/coding-agent[39m
+
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseAgentCronSchedule[2m > [22mparses one-shot relative schedules
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseAgentCronSchedule[2m > [22mparses cron aliases and five-field cron subsets
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseAgentCronSchedule[2m > [22mparses recurring heartbeat intervals with seconds
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseAgentCronSchedule[2m > [22mrejects unsupported cron syntax
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseHeartbeatCommand[2m > [22mmatches the goal-style status and lifecycle commands
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseHeartbeatCommand[2m > [22mleaves delivery mode unset when an instruction omits the delivery option
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseHeartbeatCommand[2m > [22maccepts explicit heartbeat intervals
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseHeartbeatCommand[2m > [22mopts into follow-up delivery via --follow-up before or after the interval
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseHeartbeatCommand[2m > [22mrejects invalid delivery mode values in delivery flag positions
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseHeartbeatCommand[2m > [22mkeeps delivery-like flags in the middle of an instruction as instruction text
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mparseHeartbeatCommand[2m > [22maccepts an explicit --steer flag that keeps the default delivery mode
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mpersists, reloads, and cancels jobs
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22misolates worker-owned jobs in registered session artifact stores
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mmoves active-session jobs to the replacement session artifact store
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mmigrates the legacy global store into per-session artifact stores
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mmarks in-flight legacy dispatches interrupted during migration
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mkeeps overdue jobs eligible for the scheduler after restart
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mpreserves concurrent cron store writes when a stale snapshot is written
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mkeeps newer cron store state when a stale snapshot is written
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mpreserves session-artifact dispatches when a stale snapshot is written
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mkeeps one persistent heartbeat per active session
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mdefaults heartbeats to steer delivery and persists an explicit follow_up opt-out
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mdefaults RLM heartbeats to steer delivery and updates the delivery mode
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mpauses, resumes, and clears heartbeat state
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mrejects one-shot heartbeat schedules
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mrebinds persisted session jobs to a new daemon active session id
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mmoves live session jobs to a replacement session file
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mkeeps multiple RLM heartbeats separate from the single user heartbeat
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mcancels active RLM heartbeats for a released session
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mcancels active and paused jobs for a removed session
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mreturns undefined when updating inactive RLM heartbeats
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronJobStore[2m > [22mupdates and deletes only RLM heartbeats in the matching RLM session
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mruns due one-shot jobs and marks them completed
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mdoes not claim new jobs after a started scheduler is stopped
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mreleases leases and recovers the whole claimed batch when setup fails
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mreschedules recurring jobs after each run
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mreschedules interval heartbeats after each run
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mdoes not run an RLM heartbeat that was deleted before it became due
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mreschedules skipped jobs without recording a run
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mskips jobs cancelled while earlier due jobs are running
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mdispatches different sessions concurrently and advances their schedules before completion
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mserializes simultaneous jobs that target the same session
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mcoalesces a missed interval while its previous dispatch is still active
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mreschedules a skipped dispatch from the skip time
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mdoes not replay an uncertain claimed dispatch after recovery
+ [31m×[39m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mtimes out a hung dispatch, aborts it, and releases the same-session lane[32m 31[2mms[22m[39m
+[31m   → expected [] to deeply equal [ 'first' ][39m
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mshouldDeferHeartbeatCronJob[2m > [22mdefers follow-up heartbeats while the target session is working
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mshouldDeferHeartbeatCronJob[2m > [22mlets steer heartbeats interrupt a plain streaming turn
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mshouldDeferHeartbeatCronJob[2m > [22mdefers steer heartbeats when delivering would be unsafe or would stack work
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mshouldDeferHeartbeatCronJob[2m > [22mallows heartbeats when the target session is idle
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mshouldDeferHeartbeatCronJob[2m > [22mdoes not defer ordinary cron jobs
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mheartbeat delivery mode[2m > [22mnormalizes valid delivery modes and rejects invalid ones
+ [2m[90m↓[39m[22m test/cron-jobs.test.ts[2m > [22mheartbeat delivery mode[2m > [22mresolves delivery mode to a streaming behavior, defaulting to steer
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 1 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m test/cron-jobs.test.ts[2m > [22mAgentCronScheduler[2m > [22mtimes out a hung dispatch, aborts it, and releases the same-session lane
+[31m[1mAssertionError[22m: expected [] to deeply equal [ 'first' ][39m
+
+[2mCompared values have no visual difference.[22m
+
+[36m [2m❯[22m test/cron-jobs.test.ts:[2m1375:20[22m[39m
+    [90m1373|[39m    [35mawait[39m [33mPromise[39m[33m.[39m[34mresolve[39m()[33m;[39m
+    [90m1374|[39m    [35mawait[39m [33mPromise[39m[33m.[39m[34mresolve[39m()[33m;[39m
+    [90m1375|[39m    [34mexpect[39m(started)[33m.[39m[34mtoEqual[39m([[32m"first"[39m])[33m;[39m
+    [90m   |[39m                    [31m^[39m
+    [90m1376|[39m
+    [90m1377|[39m    [35mawait[39m vi[33m.[39m[34madvanceTimersByTimeAsync[39m([34m1_000[39m)[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[90m (1)[39m
+[2m      Tests [22m [1m[31m1 failed[39m[22m[2m | [22m[33m52 skipped[39m[90m (53)[39m
+[2m   Start at [22m 18:19:46
+[2m   Duration [22m 341ms[2m (transform 134ms, setup 0ms, import 172ms, tests 34ms, environment 0ms)[22m
+
+EXIT=1

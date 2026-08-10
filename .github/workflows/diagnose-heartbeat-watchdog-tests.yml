@@ -1,0 +1,80 @@
+name: Diagnose heartbeat watchdog regressions
+
+on:
+  push:
+    branches:
+      - fix/heartbeat-dispatch-watchdog
+    paths:
+      - .github/workflows/diagnose-heartbeat-watchdog-tests.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/heartbeat-dispatch-watchdog
+
+      - name: Apply corrected watchdog patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          staged = Path('.github/workflows/apply-heartbeat-watchdog.yml')
+          workflow = staged.read_text()
+          match = re.search(r"          python3 - <<'PY'\n(.*?)\n          PY\n", workflow, re.S)
+          if not match:
+              raise SystemExit('could not extract staged patch')
+          exec(compile(textwrap.dedent(match.group(1)), str(staged), 'exec'))
+
+          daemon = Path('packages/coding-agent/src/modes/daemon/daemon-mode.ts')
+          text = daemon.read_text()
+          old = '''\t\t\tawait session.followUp(runnableJob.prompt, undefined, {
+          \t\t\t\tresumeIfIdle: true,
+          \t\t\t\tsignal,
+          \t\t\t});'''
+          new = '''\t\t\tawait session.followUp(runnableJob.prompt, undefined, {
+          \t\t\t\tresumeIfIdle: true,
+          \t\t\t});'''
+          if text.count(old) != 1:
+              raise SystemExit('expected exactly one queued follow-up signal')
+          daemon.write_text(text.replace(old, new))
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run isolated regressions and annotate output
+        shell: bash
+        run: |
+          set +e
+          cd packages/coding-agent
+          timeout 90s npx vitest --run test/cron-jobs.test.ts -t "times out a hung dispatch" --reporter=verbose > /tmp/cron-watchdog.log 2>&1
+          cron_status=$?
+          timeout 90s npx vitest --run test/daemon-mode.test.ts -t "propagates cancellation into a directly accepted heartbeat turn" --reporter=verbose > /tmp/daemon-watchdog.log 2>&1
+          daemon_status=$?
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for label, path in [('cron', Path('/tmp/cron-watchdog.log')), ('daemon', Path('/tmp/daemon-watchdog.log'))]:
+              text = path.read_text(errors='replace')
+              lines = text.splitlines()
+              selected = lines[-80:] if lines else ['no output']
+              for line in selected:
+                  escaped = line.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                  print(f'::error title=heartbeat-{label}-test::{escaped}')
+          PY
+
+          echo "cron_status=$cron_status daemon_status=$daemon_status"
+          if [ "$cron_status" -ne 0 ] || [ "$daemon_status" -ne 0 ]; then
+            exit 1
+          fi

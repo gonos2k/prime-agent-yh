@@ -1,0 +1,68 @@
+name: Persist heartbeat watchdog diagnostics
+
+on:
+  push:
+    branches:
+      - fix/heartbeat-dispatch-watchdog
+    paths:
+      - .github/workflows/commit-heartbeat-watchdog-diagnostic.yml
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/heartbeat-dispatch-watchdog
+          fetch-depth: 0
+
+      - name: Reapply staged patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          path = Path('.github/workflows/apply-heartbeat-watchdog.yml')
+          workflow = path.read_text()
+          match = re.search(r"          python3 - <<'PY'\n(.*?)\n          PY\n", workflow, re.S)
+          if not match:
+              raise SystemExit('could not extract staged patch')
+          exec(compile(textwrap.dedent(match.group(1)), str(path), 'exec'))
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Capture build and check output
+        shell: bash
+        run: |
+          set +e
+          {
+            echo '=== npm run build ==='
+            npm run build
+            echo "BUILD_EXIT=$?"
+            echo
+            echo '=== npm run check ==='
+            npm run check
+            echo "CHECK_EXIT=$?"
+          } > .github/heartbeat-watchdog-build.log 2>&1
+          set -e
+
+      - name: Commit diagnostic state
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/coding-agent/src/core/cron-jobs.ts
+          git add packages/coding-agent/src/modes/daemon/daemon-mode.ts
+          git add packages/coding-agent/test/cron-jobs.test.ts
+          git add packages/coding-agent/test/daemon-mode.test.ts
+          git add -f .github/heartbeat-watchdog-build.log
+          git commit -m "wip(coding-agent): persist heartbeat watchdog diagnostics"
+          git push origin HEAD:fix/heartbeat-dispatch-watchdog

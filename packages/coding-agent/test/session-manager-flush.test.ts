@@ -437,3 +437,63 @@ describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
 		expect(readFileSync(file)).toEqual(before);
 	});
 });
+
+describe("SessionManager transactional appends", () => {
+	it("rolls back an ordinary message and repairs a torn JSONL tail", () => {
+		const { mgr, file, before } = createPersistedSessionForRollbackTest();
+		const previousLeafId = mgr.getLeafId();
+		const previousEntryCount = mgr.getEntries().length;
+		failNextOutcomeAppend(mgr, file);
+
+		expect(() => mgr.appendMessage({ role: "user", content: "not durable", timestamp: Date.now() })).toThrow(
+			"append failed",
+		);
+
+		expect(mgr.getLeafId()).toBe(previousLeafId);
+		expect(mgr.getEntries()).toHaveLength(previousEntryCount);
+		expect(readFileSync(file)).toEqual(before);
+	});
+
+	it("does not expose aggregate child usage without a durable attribution", () => {
+		const { mgr, file, before } = createPersistedSessionForRollbackTest();
+		const target = mgr.getLeafEntry();
+		if (!target || target.type !== "message" || target.message.role !== "assistant") {
+			throw new Error("expected assistant leaf");
+		}
+		const originalUsage = structuredClone(target.message.usage);
+		const previousLeafId = mgr.getLeafId();
+		failNextOutcomeAppend(mgr, file);
+
+		expect(() =>
+			mgr.appendChildUsageAttribution(
+				target.id,
+				{
+					input: 2,
+					output: 3,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 5,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				{
+					input: 3,
+					output: 4,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 7,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			),
+		).toThrow("append failed");
+
+		const restored = mgr.getEntry(target.id);
+		expect(restored?.type).toBe("message");
+		if (!restored || restored.type !== "message" || restored.message.role !== "assistant") {
+			throw new Error("expected restored assistant entry");
+		}
+		expect(restored.message.usage).toEqual(originalUsage);
+		expect(mgr.getLeafId()).toBe(previousLeafId);
+		expect(mgr.getEntries().some((entry) => entry.type === "child_usage_attributed")).toBe(false);
+		expect(readFileSync(file)).toEqual(before);
+	});
+});

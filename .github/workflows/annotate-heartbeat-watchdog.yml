@@ -1,0 +1,67 @@
+name: Annotate heartbeat watchdog diagnostics
+
+on:
+  push:
+    branches:
+      - fix/heartbeat-dispatch-watchdog
+    paths:
+      - .github/workflows/annotate-heartbeat-watchdog.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/heartbeat-dispatch-watchdog
+
+      - name: Reapply staged patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          path = Path('.github/workflows/apply-heartbeat-watchdog.yml')
+          workflow = path.read_text()
+          match = re.search(r"          python3 - <<'PY'\n(.*?)\n          PY\n", workflow, re.S)
+          if not match:
+              raise SystemExit('could not extract staged patch')
+          exec(compile(textwrap.dedent(match.group(1)), str(path), 'exec'))
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Annotate build and check errors
+        shell: bash
+        run: |
+          set +e
+          npm run build > /tmp/build.log 2>&1
+          build_status=$?
+          npm run check > /tmp/check.log 2>&1
+          check_status=$?
+          set -e
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lines = []
+          for label, path in [('build', Path('/tmp/build.log')), ('check', Path('/tmp/check.log'))]:
+              text = path.read_text(errors='replace')
+              selected = [line for line in text.splitlines() if ('error TS' in line or 'Error:' in line or 'FAIL' in line)]
+              if not selected:
+                  selected = text.splitlines()[-20:]
+              for line in selected[:40]:
+                  escaped = line.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                  print(f'::error title=heartbeat-watchdog-{label}::{escaped}')
+          PY
+
+          if [ "$build_status" -ne 0 ] || [ "$check_status" -ne 0 ]; then
+            exit 1
+          fi

@@ -1,0 +1,136 @@
+name: Finalize heartbeat dispatch watchdog
+
+on:
+  push:
+    branches:
+      - fix/heartbeat-dispatch-watchdog
+    paths:
+      - .github/workflows/finalize-heartbeat-watchdog.yml
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/heartbeat-dispatch-watchdog
+          fetch-depth: 0
+
+      - name: Apply corrected watchdog patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          staged = Path('.github/workflows/apply-heartbeat-watchdog.yml')
+          workflow = staged.read_text()
+          match = re.search(r"          python3 - <<'PY'\n(.*?)\n          PY\n", workflow, re.S)
+          if not match:
+              raise SystemExit('could not extract staged patch')
+          exec(compile(textwrap.dedent(match.group(1)), str(staged), 'exec'))
+
+          daemon = Path('packages/coding-agent/src/modes/daemon/daemon-mode.ts')
+          text = daemon.read_text()
+          old_follow_up = '''\t\t\tawait session.followUp(runnableJob.prompt, undefined, {
+          \t\t\t\tresumeIfIdle: true,
+          \t\t\t\tsignal,
+          \t\t\t});'''
+          new_follow_up = '''\t\t\tawait session.followUp(runnableJob.prompt, undefined, {
+          \t\t\t\tresumeIfIdle: true,
+          \t\t\t});'''
+          if text.count(old_follow_up) != 1:
+              raise SystemExit('expected exactly one queued follow-up signal')
+          daemon.write_text(text.replace(old_follow_up, new_follow_up))
+
+          cron_test = Path('packages/coding-agent/test/cron-jobs.test.ts')
+          tests = cron_test.read_text()
+          old_setup = '''\t\t\tconst started: string[] = [];
+          \t\t\tlet firstSignal: AbortSignal | undefined;
+          \t\t\tlet releaseFirst: () => void = () => {};
+          \t\t\tconst onError = vi.fn();'''
+          new_setup = '''\t\t\tconst started: string[] = [];
+          \t\t\tlet firstSignal: AbortSignal | undefined;
+          \t\t\tlet releaseFirst: () => void = () => {};
+          \t\t\tlet markFirstStarted: () => void = () => {};
+          \t\t\tconst firstStarted = new Promise<void>((resolve) => {
+          \t\t\t\tmarkFirstStarted = resolve;
+          \t\t\t});
+          \t\t\tconst onError = vi.fn();'''
+          if tests.count(old_setup) != 1:
+              raise SystemExit('expected watchdog test setup')
+          tests = tests.replace(old_setup, new_setup)
+
+          old_first_run = '''\t\t\t\t\tif (job.id === first.id) {
+          \t\t\t\t\t\tfirstSignal = context.signal;
+          \t\t\t\t\t\tawait new Promise<void>((resolve) => {'''
+          new_first_run = '''\t\t\t\t\tif (job.id === first.id) {
+          \t\t\t\t\t\tfirstSignal = context.signal;
+          \t\t\t\t\t\tmarkFirstStarted();
+          \t\t\t\t\t\tawait new Promise<void>((resolve) => {'''
+          if tests.count(old_first_run) != 1:
+              raise SystemExit('expected first watchdog dispatch')
+          tests = tests.replace(old_first_run, new_first_run)
+
+          old_wait = '''\t\t\tconst run = scheduler.runDue(new Date("2026-01-01T12:35:00.000Z"));
+          \t\t\tawait Promise.resolve();
+          \t\t\tawait Promise.resolve();
+          \t\t\texpect(started).toEqual(["first"]);'''
+          new_wait = '''\t\t\tconst run = scheduler.runDue(new Date("2026-01-01T12:35:00.000Z"));
+          \t\t\tawait firstStarted;
+          \t\t\texpect(started).toEqual(["first"]);'''
+          if tests.count(old_wait) != 1:
+              raise SystemExit('expected watchdog startup wait')
+          cron_test.write_text(tests.replace(old_wait, new_wait))
+          PY
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and check
+        run: |
+          npm run build
+          npm run check
+
+      - name: Run isolated watchdog regressions
+        working-directory: packages/coding-agent
+        run: |
+          npx vitest --run test/cron-jobs.test.ts -t "times out a hung dispatch" --reporter=verbose
+          npx vitest --run test/daemon-mode.test.ts -t "propagates cancellation into a directly accepted heartbeat turn" --reporter=verbose
+
+      - name: Run full scheduler and daemon regression files
+        working-directory: packages/coding-agent
+        run: npx vitest --run test/cron-jobs.test.ts test/daemon-mode.test.ts
+
+      - name: Remove staging and diagnostic artifacts
+        shell: bash
+        run: |
+          rm -f \
+            .github/workflows/apply-heartbeat-watchdog.yml \
+            .github/workflows/diagnose-heartbeat-watchdog.yml \
+            .github/workflows/commit-heartbeat-watchdog-diagnostic.yml \
+            .github/workflows/annotate-heartbeat-watchdog.yml \
+            .github/workflows/apply-heartbeat-watchdog-v2.yml \
+            .github/workflows/diagnose-heartbeat-watchdog-tests.yml \
+            .github/workflows/persist-heartbeat-watchdog-test-logs.yml \
+            .github/workflows/persist-heartbeat-watchdog-test-logs.yml \
+            .github/workflows/finalize-heartbeat-watchdog.yml \
+            .github/workflows/commit-heartbeat-watchdog-diagnostic.yml \
+            .github/workflows/persist-heartbeat-watchdog-test-logs.yml \
+            .github/cron-watchdog-test.log \
+            .github/daemon-watchdog-test.log \
+            .github/heartbeat-watchdog-build.log
+
+      - name: Commit final patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(coding-agent): bound scheduled-job dispatches"
+          git push origin HEAD:fix/heartbeat-dispatch-watchdog

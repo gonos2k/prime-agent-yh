@@ -1,0 +1,409 @@
+diff --git a/packages/coding-agent/CHANGELOG.md b/packages/coding-agent/CHANGELOG.md
+index f7100b5..f3c5b6a 100644
+--- a/packages/coding-agent/CHANGELOG.md
++++ b/packages/coding-agent/CHANGELOG.md
+@@ -4,6 +4,7 @@
+ 
+ - Added privacy-safe pseudonymous product analytics for onboarding, command use, execution modes, run outcomes, TTFT, latency, usage, tools, retries, and compactions, with disclosure and opt-out controls ([ENG-4682](https://linear.app/primeintellect/issue/ENG-4682/add-privacy-safe-posthog-analytics-to-prime-agent)).
+ - Changed sent agent messages in the IPython cell UI to show only the message text with a `╰─` gutter when expanded, matching received messages, and hid the raw `agent_message.send` receipt dictionary.
++- Fixed compaction accepting truncated or empty model summaries, inventing PR or commit identifiers, and dropping explicit user requirements across repeated compactions.
+ - Fixed Homebrew installs attempting to self-update their versioned Cellar keg instead of directing users to `brew upgrade prime-agent` ([#844](https://github.com/PrimeIntellect-ai/prime-agent/issues/844))
+ 
+ ## [0.7.1] - 2026-08-07
+diff --git a/packages/coding-agent/src/core/compaction/compaction.ts b/packages/coding-agent/src/core/compaction/compaction.ts
+index b48e6ba..6259188 100644
+--- a/packages/coding-agent/src/core/compaction/compaction.ts
++++ b/packages/coding-agent/src/core/compaction/compaction.ts
+@@ -24,6 +24,14 @@ import {
+ 	SUMMARIZATION_SYSTEM_PROMPT,
+ 	serializeConversation,
+ } from "./utils.js";
++import {
++	appendPreservedUserRequirements,
++	buildCompactionSafetyDetails,
++	buildSummarySourceText,
++	collectPreservedUserRequirements,
++	type CompactionSafetyDetails,
++	validateSummaryResponse,
++} from "./summary-safety.js";
+ 
+ // ============================================================================
+ // File Operation Tracking
+@@ -33,6 +41,7 @@ import {
+ export interface CompactionDetails {
+ 	readFiles: string[];
+ 	modifiedFiles: string[];
++	safety?: CompactionSafetyDetails;
+ }
+ 
+ /**
+@@ -534,7 +543,8 @@ Use this EXACT format:
+ - [Any data, examples, or references needed to continue]
+ - [Or "(none)" if not applicable]
+ 
+-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
++Keep each section concise. Preserve exact file paths, function names, and error messages.
++Do not invent facts or identifiers. Mark work as done only when the conversation contains explicit completion evidence.`;
+ 
+ const KERNEL_PERSIST_SUMMARY_NOTE =
+ 	"Note: the IPython kernel keeps running after this summary — every Python variable, import, and helper you defined stays available. The cells that defined them won't appear above, so record in the summary any names worth remembering so you reuse them instead of redefining them.";
+@@ -576,7 +586,8 @@ Use this EXACT format:
+ ## Critical Context
+ - [Preserve important context, add new if needed]
+ 
+-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
++Keep each section concise. Preserve exact file paths, function names, and error messages.
++Do not invent facts or identifiers. Mark work as done only when the conversation contains explicit completion evidence.`;
+ 
+ /**
+  * Build the instruction portion of the summarization prompt: the initial or
+@@ -640,16 +651,12 @@ export async function generateSummary(
+ 		completionOptions,
+ 	);
+ 
+-	if (response.stopReason === "error") {
+-		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
+-	}
+-
+-	const textContent = response.content
+-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+-		.map((c) => c.text)
+-		.join("\n");
+-
+-	return textContent;
++	return validateSummaryResponse(
++		response,
++		"history",
++		buildSummarySourceText(currentMessages, previousSummary, customInstructions),
++		"Summarization",
++	);
+ }
+ 
+ // ============================================================================
+@@ -774,7 +781,7 @@ Summarize the prefix to provide context for the retained suffix:
+ ## Context for Suffix
+ - [Information needed to understand the retained recent work]
+ 
+-Be concise. Focus on what's needed to understand the kept suffix.`;
++Be concise. Focus on what's needed to understand the kept suffix. Do not invent facts or identifiers.`;
+ 
+ /**
+  * Generate summaries for compaction using prepared data.
+@@ -802,6 +809,14 @@ export async function compact(
+ 		fileOps,
+ 		settings,
+ 	} = preparation;
++	const safetyMessages = isSplitTurn
++		? [...messagesToSummarize, ...turnPrefixMessages]
++		: messagesToSummarize;
++	const preservedUserRequirements = collectPreservedUserRequirements(
++		safetyMessages,
++		previousSummary,
++		customInstructions,
++	);
+ 
+ 	// Generate summaries (can be parallel if both needed) and merge into one
+ 	let summary: string;
+@@ -852,6 +867,14 @@ export async function compact(
+ 	// Compute file lists and append to summary
+ 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
+ 	summary += formatFileOperations(readFiles, modifiedFiles);
++	summary = appendPreservedUserRequirements(summary, preservedUserRequirements);
++	const safety = buildCompactionSafetyDetails(
++		summary,
++		safetyMessages,
++		preservedUserRequirements,
++		previousSummary,
++		customInstructions,
++	);
+ 
+ 	if (!firstKeptEntryId) {
+ 		throw new Error("First kept entry has no UUID - session may need migration");
+@@ -861,7 +884,7 @@ export async function compact(
+ 		summary,
+ 		firstKeptEntryId,
+ 		tokensBefore,
+-		details: { readFiles, modifiedFiles } as CompactionDetails,
++		details: { readFiles, modifiedFiles, safety } as CompactionDetails,
+ 	};
+ }
+ 
+@@ -897,12 +920,10 @@ async function generateTurnPrefixSummary(
+ 			: { maxTokens, signal, apiKey, headers },
+ 	);
+ 
+-	if (response.stopReason === "error") {
+-		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);
+-	}
+-
+-	return response.content
+-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+-		.map((c) => c.text)
+-		.join("\n");
++	return validateSummaryResponse(
++		response,
++		"turn-prefix",
++		buildSummarySourceText(messages),
++		"Turn prefix summarization",
++	);
+ }
+diff --git a/packages/coding-agent/src/core/compaction/summary-safety.ts b/packages/coding-agent/src/core/compaction/summary-safety.ts
+index 7201fc1..3506f48 100644
+--- a/packages/coding-agent/src/core/compaction/summary-safety.ts
++++ b/packages/coding-agent/src/core/compaction/summary-safety.ts
+@@ -49,6 +49,8 @@ const TURN_PREFIX_REQUIRED_SECTIONS = [
+ ] as const;
+ 
+ const PRESERVED_REQUIREMENTS_HEADING = "## Preserved User Requirements";
++const PRESERVED_REQUIREMENTS_START = "<!-- prime-agent:preserved-user-requirements:v1 -->";
++const PRESERVED_REQUIREMENTS_END = "<!-- /prime-agent:preserved-user-requirements -->";
+ const MAX_PRESERVED_REQUIREMENTS = 64;
+ const MAX_PRESERVED_REQUIREMENT_CHARS = 12_000;
+ 
+@@ -84,19 +86,26 @@ function requirementCandidates(text: string): string[] {
+ }
+ 
+ function requirementKey(requirement: string): string {
+-	return requirement.replace(/\s+/gu, " ").trim().toLocaleLowerCase();
++	return requirement.replace(/\s+/gu, " ").trim().toLowerCase();
+ }
+ 
+ function extractPreviousRequirements(previousSummary?: string): string[] {
+ 	if (!previousSummary) return [];
+-	const sectionIndex = previousSummary.lastIndexOf(PRESERVED_REQUIREMENTS_HEADING);
+-	if (sectionIndex < 0) return [];
++	const startIndex = previousSummary.lastIndexOf(PRESERVED_REQUIREMENTS_START);
++	if (startIndex < 0) return [];
++	const contentStart = startIndex + PRESERVED_REQUIREMENTS_START.length;
++	const endIndex = previousSummary.indexOf(PRESERVED_REQUIREMENTS_END, contentStart);
++	if (endIndex < 0) return [];
+ 
+-	const section = previousSummary.slice(sectionIndex + PRESERVED_REQUIREMENTS_HEADING.length);
++	const section = previousSummary.slice(contentStart, endIndex);
+ 	const requirements: string[] = [];
+ 	const pattern = /<requirement id="[^"]+">\n([\s\S]*?)\n<\/requirement>/gu;
+ 	for (const match of section.matchAll(pattern)) {
+-		const requirement = match[1]?.replaceAll("<\\/requirement>", "</requirement>").trim();
++		const requirement = match[1]
++			?.replaceAll("<\\/requirement>", "</requirement>")
++			.replaceAll("<\\!-- prime-agent:preserved-user-requirements:v1 --\\>", PRESERVED_REQUIREMENTS_START)
++			.replaceAll("<\\!-- /prime-agent:preserved-user-requirements --\\>", PRESERVED_REQUIREMENTS_END)
++			.trim();
+ 		if (requirement) requirements.push(requirement);
+ 	}
+ 	return requirements;
+@@ -154,9 +163,11 @@ export function collectPreservedUserRequirements(
+ }
+ 
+ function stripTrailingPreservedRequirements(summary: string): string {
+-	const sectionIndex = summary.lastIndexOf(PRESERVED_REQUIREMENTS_HEADING);
+-	if (sectionIndex < 0) return summary.trimEnd();
+-	return summary.slice(0, sectionIndex).trimEnd();
++	const startIndex = summary.lastIndexOf(PRESERVED_REQUIREMENTS_START);
++	if (startIndex < 0) return summary.trimEnd();
++	const headingIndex = summary.lastIndexOf(PRESERVED_REQUIREMENTS_HEADING, startIndex);
++	if (headingIndex < 0) return summary.trimEnd();
++	return summary.slice(0, headingIndex).trimEnd();
+ }
+ 
+ /** Append exact requirements after the generated summary and deterministic file ledger. */
+@@ -165,11 +176,45 @@ export function appendPreservedUserRequirements(summary: string, requirements: s
+ 	if (requirements.length === 0) return base;
+ 
+ 	const blocks = requirements.map((requirement, index) => {
+-		const escaped = requirement.replaceAll("</requirement>", "<\\/requirement>");
++		const escaped = requirement
++			.replaceAll("</requirement>", "<\\/requirement>")
++			.replaceAll(PRESERVED_REQUIREMENTS_START, "<\\!-- prime-agent:preserved-user-requirements:v1 --\\>")
++			.replaceAll(PRESERVED_REQUIREMENTS_END, "<\\!-- /prime-agent:preserved-user-requirements --\\>");
+ 		return `<requirement id="r${index + 1}">\n${escaped}\n</requirement>`;
+ 	});
+ 
+-	return `${base}\n\n${PRESERVED_REQUIREMENTS_HEADING}\n${blocks.join("\n")}`;
++	return `${base}\n\n${PRESERVED_REQUIREMENTS_HEADING}\n${PRESERVED_REQUIREMENTS_START}\n${blocks.join("\n")}\n${PRESERVED_REQUIREMENTS_END}`;
++}
++
++function contentText(content: string | Array<{ type: string; text?: string }>): string {
++	if (typeof content === "string") return content;
++	return content
++		.filter((block): block is { type: "text"; text: string } => block.type === "text")
++		.map((block) => block.text)
++		.join("\n");
++}
++
++function messageTextForSafety(message: AgentMessage): string {
++	switch (message.role) {
++		case "user":
++		case "custom":
++		case "toolResult":
++			return contentText(message.content);
++		case "assistant": {
++			const parts: string[] = [];
++			for (const block of message.content) {
++				if (block.type === "text") parts.push(block.text);
++				else if (block.type === "thinking") parts.push(block.thinking);
++				else if (block.type === "toolCall") parts.push(block.name, JSON.stringify(block.arguments));
++			}
++			return parts.join("\n");
++		}
++		case "bashExecution":
++			return `${message.command}\n${message.output}`;
++		case "branchSummary":
++		case "compactionSummary":
++			return message.summary;
++	}
+ }
+ 
+ /** Build a source corpus for deterministic identifier validation. */
+@@ -178,7 +223,7 @@ export function buildSummarySourceText(
+ 	previousSummary?: string,
+ 	customInstructions?: string,
+ ): string {
+-	return [JSON.stringify(messages), previousSummary ?? "", customInstructions ?? ""].join("\n");
++	return [messages.map(messageTextForSafety).join("\n"), previousSummary ?? "", customInstructions ?? ""].join("\n");
+ }
+ 
+ export function extractSummaryIdentifiers(text: string): SummaryIdentifiers {
+@@ -187,7 +232,7 @@ export function extractSummaryIdentifiers(text: string): SummaryIdentifiers {
+ 
+ 	const commitPattern = /\b(?=[0-9a-f]{7,40}\b)(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/giu;
+ 	for (const match of text.matchAll(commitPattern)) {
+-		commitShas.add(match[0].toLocaleLowerCase());
++		commitShas.add(match[0].toLowerCase());
+ 	}
+ 
+ 	const pullRequestPattern = /\b(?:PR|pull\s+request)\s*#\s*(\d+)\b/giu;
+@@ -205,6 +250,9 @@ export function extractSummaryIdentifiers(text: string): SummaryIdentifiers {
+ function validateSections(summary: string, kind: CompactionSummaryKind): void {
+ 	const requiredSections = kind === "history" ? HISTORY_REQUIRED_SECTIONS : TURN_PREFIX_REQUIRED_SECTIONS;
+ 	const lines = summary.split(/\r?\n/u).map((line) => line.trim());
++	const presentSections = requiredSections.filter((section) => lines.includes(section));
++	if (presentSections.length === 0) return;
++
+ 	let previousIndex = -1;
+ 
+ 	for (const section of requiredSections) {
+diff --git a/packages/coding-agent/test/compaction-summary-reasoning.test.ts b/packages/coding-agent/test/compaction-summary-reasoning.test.ts
+index c674ef1..f16ee4b 100644
+--- a/packages/coding-agent/test/compaction-summary-reasoning.test.ts
++++ b/packages/coding-agent/test/compaction-summary-reasoning.test.ts
+@@ -1,7 +1,13 @@
+ import type { AgentMessage } from "@earendil-works/pi-agent-core";
+ import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
+ import { beforeEach, describe, expect, it, vi } from "vitest";
+-import { generateSummary } from "../src/core/compaction/index.js";
++import {
++	compact,
++	type CompactionPreparation,
++	CompactionSummarySafetyError,
++	createFileOps,
++	generateSummary,
++} from "../src/core/compaction/index.js";
+ 
+ const { completeSimpleMock } = vi.hoisted(() => ({
+ 	completeSimpleMock: vi.fn(),
+@@ -32,7 +38,35 @@ function createModel(reasoning: boolean): Model<"anthropic-messages"> {
+ 
+ const mockSummaryResponse: AssistantMessage = {
+ 	role: "assistant",
+-	content: [{ type: "text", text: "## Goal\nTest summary" }],
++	content: [
++		{
++			type: "text",
++			text: `## Goal
++Test summary.
++
++## Constraints & Preferences
++- (none)
++
++## Progress
++### Done
++- [x] Read the source conversation.
++
++### In Progress
++- [ ] Continue the test.
++
++### Blocked
++- (none)
++
++## Key Decisions
++- **Validation**: preserve the required section contract.
++
++## Next Steps
++1. Return the summary.
++
++## Critical Context
++- (none)`,
++		},
++	],
+ 	api: "anthropic-messages",
+ 	provider: "anthropic",
+ 	model: "claude-sonnet-4-5",
+@@ -115,4 +149,67 @@ describe("generateSummary reasoning options", () => {
+ 		});
+ 		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("reasoning");
+ 	});
++
++	it("rejects a length-truncated model response", async () => {
++		completeSimpleMock.mockResolvedValue({ ...mockSummaryResponse, stopReason: "length" });
++
++		await expect(generateSummary(messages, createModel(false), 2000, "test-key")).rejects.toMatchObject({
++			name: CompactionSummarySafetyError.name,
++			code: "truncated-response",
++		});
++	});
++
++	it("rejects an unsupported PR identifier", async () => {
++		completeSimpleMock.mockResolvedValue({
++			...mockSummaryResponse,
++			content: [
++				{
++					type: "text",
++					text: `${mockSummaryResponse.content[0]?.type === "text" ? mockSummaryResponse.content[0].text : ""}\n- PR #918 completed.`,
++				},
++			],
++		});
++
++		await expect(
++			generateSummary(
++				[{ role: "user", content: "Continue work on PR #17.", timestamp: Date.now() }],
++				createModel(false),
++				2000,
++				"test-key",
++			),
++		).rejects.toMatchObject({
++			name: CompactionSummarySafetyError.name,
++			code: "invented-identifier",
++		});
++	});
++
++	it("pins exact user requirements outside the lossy model summary", async () => {
++		const preparation: CompactionPreparation = {
++			firstKeptEntryId: "kept-entry",
++			messagesToSummarize: [
++				{
++					role: "user",
++					content: "Implement the change.\nDo not change the public API.",
++					timestamp: Date.now(),
++				},
++			],
++			turnPrefixMessages: [],
++			isSplitTurn: false,
++			tokensBefore: 10_000,
++			fileOps: createFileOps(),
++			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 1000 },
++		};
++
++		const result = await compact(preparation, createModel(false), "test-key");
++
++		expect(result.summary).toContain(
++			'<requirement id="r1">\nDo not change the public API.\n</requirement>',
++		);
++		expect(result.details).toMatchObject({
++			safety: {
++				version: 1,
++				preservedUserRequirements: ["Do not change the public API."],
++			},
++		});
++	});
+ });

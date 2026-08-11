@@ -5,8 +5,8 @@ import {
 	appendPreservedUserRequirements,
 	buildCompactionSafetyDetails,
 	buildSummarySourceText,
-	collectPreservedUserRequirements,
 	CompactionSummarySafetyError,
+	collectPreservedUserRequirements,
 	extractSummaryIdentifiers,
 	validateSummaryResponse,
 	validateSummaryText,
@@ -78,9 +78,7 @@ function expectSafetyError(action: () => unknown, code: CompactionSummarySafetyE
 
 describe("compaction summary response safety", () => {
 	it("accepts a complete normally terminated history summary", () => {
-		expect(validateSummaryResponse(response("stop"), "history", "", "Summarization")).toBe(
-			VALID_HISTORY_SUMMARY,
-		);
+		expect(validateSummaryResponse(response("stop"), "history", "", "Summarization")).toBe(VALID_HISTORY_SUMMARY);
 	});
 
 	it("accepts the turn-prefix contract", () => {
@@ -111,10 +109,7 @@ describe("compaction summary response safety", () => {
 	});
 
 	it("rejects a summary missing a required section", () => {
-		expectSafetyError(
-			() => validateSummaryText("## Goal\nOnly a goal", "history", ""),
-			"missing-section",
-		);
+		expectSafetyError(() => validateSummaryText("## Goal\nOnly a goal", "history", ""), "missing-section");
 	});
 });
 
@@ -166,9 +161,7 @@ describe("deterministic user-requirement pinning", () => {
 
 	it("carries prior pinned requirements forward without duplication", () => {
 		const previous = appendPreservedUserRequirements(VALID_HISTORY_SUMMARY, ["Never push directly to main."]);
-		const messages: AgentMessage[] = [
-			{ role: "user", content: "Never push directly to main.", timestamp: 1 },
-		];
+		const messages: AgentMessage[] = [{ role: "user", content: "Never push directly to main.", timestamp: 1 }];
 		expect(collectPreservedUserRequirements(messages, previous)).toEqual(["Never push directly to main."]);
 	});
 
@@ -176,7 +169,7 @@ describe("deterministic user-requirement pinning", () => {
 		const generated = appendPreservedUserRequirements(VALID_HISTORY_SUMMARY, ["invented"]);
 		const result = appendPreservedUserRequirements(generated, ["Do not change the API."]);
 		expect(result).not.toContain("invented");
-		expect(result).toContain("<requirement id=\"r1\">\nDo not change the API.\n</requirement>");
+		expect(result).toContain('<requirement id="r1">\nDo not change the API.\n</requirement>');
 	});
 
 	it("records the exact preservation and identifier evidence in details", () => {

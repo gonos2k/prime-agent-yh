@@ -16,6 +16,14 @@ import {
 } from "../messages.js";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import {
+	appendPreservedUserRequirements,
+	buildCompactionSafetyDetails,
+	buildSummarySourceText,
+	type CompactionSafetyDetails,
+	collectPreservedUserRequirements,
+	validateSummaryResponse,
+} from "./summary-safety.js";
+import {
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
@@ -33,6 +41,7 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	safety?: CompactionSafetyDetails;
 }
 
 /**
@@ -534,7 +543,8 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise. Preserve exact file paths, function names, and error messages.
+Do not invent facts or identifiers. Mark work as done only when the conversation contains explicit completion evidence.`;
 
 const KERNEL_PERSIST_SUMMARY_NOTE =
 	"Note: the IPython kernel keeps running after this summary — every Python variable, import, and helper you defined stays available. The cells that defined them won't appear above, so record in the summary any names worth remembering so you reuse them instead of redefining them.";
@@ -576,7 +586,8 @@ Use this EXACT format:
 ## Critical Context
 - [Preserve important context, add new if needed]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+Keep each section concise. Preserve exact file paths, function names, and error messages.
+Do not invent facts or identifiers. Mark work as done only when the conversation contains explicit completion evidence.`;
 
 /**
  * Build the instruction portion of the summarization prompt: the initial or
@@ -640,16 +651,12 @@ export async function generateSummary(
 		completionOptions,
 	);
 
-	if (response.stopReason === "error") {
-		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	const textContent = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
-
-	return textContent;
+	return validateSummaryResponse(
+		response,
+		"history",
+		buildSummarySourceText(currentMessages, previousSummary, customInstructions),
+		"Summarization",
+	);
 }
 
 // ============================================================================
@@ -774,7 +781,7 @@ Summarize the prefix to provide context for the retained suffix:
 ## Context for Suffix
 - [Information needed to understand the retained recent work]
 
-Be concise. Focus on what's needed to understand the kept suffix.`;
+Be concise. Focus on what's needed to understand the kept suffix. Do not invent facts or identifiers.`;
 
 /**
  * Generate summaries for compaction using prepared data.
@@ -802,6 +809,12 @@ export async function compact(
 		fileOps,
 		settings,
 	} = preparation;
+	const safetyMessages = isSplitTurn ? [...messagesToSummarize, ...turnPrefixMessages] : messagesToSummarize;
+	const preservedUserRequirements = collectPreservedUserRequirements(
+		safetyMessages,
+		previousSummary,
+		customInstructions,
+	);
 
 	// Generate summaries (can be parallel if both needed) and merge into one
 	let summary: string;
@@ -852,6 +865,14 @@ export async function compact(
 	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
+	summary = appendPreservedUserRequirements(summary, preservedUserRequirements);
+	const safety = buildCompactionSafetyDetails(
+		summary,
+		safetyMessages,
+		preservedUserRequirements,
+		previousSummary,
+		customInstructions,
+	);
 
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no UUID - session may need migration");
@@ -861,7 +882,7 @@ export async function compact(
 		summary,
 		firstKeptEntryId,
 		tokensBefore,
-		details: { readFiles, modifiedFiles } as CompactionDetails,
+		details: { readFiles, modifiedFiles, safety } as CompactionDetails,
 	};
 }
 
@@ -897,12 +918,10 @@ async function generateTurnPrefixSummary(
 			: { maxTokens, signal, apiKey, headers },
 	);
 
-	if (response.stopReason === "error") {
-		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	return response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
+	return validateSummaryResponse(
+		response,
+		"turn-prefix",
+		buildSummarySourceText(messages),
+		"Turn prefix summarization",
+	);
 }

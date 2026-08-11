@@ -42,13 +42,11 @@ const HISTORY_REQUIRED_SECTIONS = [
 	"## Critical Context",
 ] as const;
 
-const TURN_PREFIX_REQUIRED_SECTIONS = [
-	"## Original Request",
-	"## Early Progress",
-	"## Context for Suffix",
-] as const;
+const TURN_PREFIX_REQUIRED_SECTIONS = ["## Original Request", "## Early Progress", "## Context for Suffix"] as const;
 
 const PRESERVED_REQUIREMENTS_HEADING = "## Preserved User Requirements";
+const PRESERVED_REQUIREMENTS_START = "<!-- prime-agent:preserved-user-requirements:v1 -->";
+const PRESERVED_REQUIREMENTS_END = "<!-- /prime-agent:preserved-user-requirements -->";
 const MAX_PRESERVED_REQUIREMENTS = 64;
 const MAX_PRESERVED_REQUIREMENT_CHARS = 12_000;
 
@@ -84,19 +82,26 @@ function requirementCandidates(text: string): string[] {
 }
 
 function requirementKey(requirement: string): string {
-	return requirement.replace(/\s+/gu, " ").trim().toLocaleLowerCase();
+	return requirement.replace(/\s+/gu, " ").trim().toLowerCase();
 }
 
 function extractPreviousRequirements(previousSummary?: string): string[] {
 	if (!previousSummary) return [];
-	const sectionIndex = previousSummary.lastIndexOf(PRESERVED_REQUIREMENTS_HEADING);
-	if (sectionIndex < 0) return [];
+	const startIndex = previousSummary.lastIndexOf(PRESERVED_REQUIREMENTS_START);
+	if (startIndex < 0) return [];
+	const contentStart = startIndex + PRESERVED_REQUIREMENTS_START.length;
+	const endIndex = previousSummary.indexOf(PRESERVED_REQUIREMENTS_END, contentStart);
+	if (endIndex < 0) return [];
 
-	const section = previousSummary.slice(sectionIndex + PRESERVED_REQUIREMENTS_HEADING.length);
+	const section = previousSummary.slice(contentStart, endIndex);
 	const requirements: string[] = [];
 	const pattern = /<requirement id="[^"]+">\n([\s\S]*?)\n<\/requirement>/gu;
 	for (const match of section.matchAll(pattern)) {
-		const requirement = match[1]?.replaceAll("<\\/requirement>", "</requirement>").trim();
+		const requirement = match[1]
+			?.replaceAll("<\\/requirement>", "</requirement>")
+			.replaceAll("<\\!-- prime-agent:preserved-user-requirements:v1 --\\>", PRESERVED_REQUIREMENTS_START)
+			.replaceAll("<\\!-- /prime-agent:preserved-user-requirements --\\>", PRESERVED_REQUIREMENTS_END)
+			.trim();
 		if (requirement) requirements.push(requirement);
 	}
 	return requirements;
@@ -154,9 +159,11 @@ export function collectPreservedUserRequirements(
 }
 
 function stripTrailingPreservedRequirements(summary: string): string {
-	const sectionIndex = summary.lastIndexOf(PRESERVED_REQUIREMENTS_HEADING);
-	if (sectionIndex < 0) return summary.trimEnd();
-	return summary.slice(0, sectionIndex).trimEnd();
+	const startIndex = summary.lastIndexOf(PRESERVED_REQUIREMENTS_START);
+	if (startIndex < 0) return summary.trimEnd();
+	const headingIndex = summary.lastIndexOf(PRESERVED_REQUIREMENTS_HEADING, startIndex);
+	if (headingIndex < 0) return summary.trimEnd();
+	return summary.slice(0, headingIndex).trimEnd();
 }
 
 /** Append exact requirements after the generated summary and deterministic file ledger. */
@@ -165,11 +172,45 @@ export function appendPreservedUserRequirements(summary: string, requirements: s
 	if (requirements.length === 0) return base;
 
 	const blocks = requirements.map((requirement, index) => {
-		const escaped = requirement.replaceAll("</requirement>", "<\\/requirement>");
+		const escaped = requirement
+			.replaceAll("</requirement>", "<\\/requirement>")
+			.replaceAll(PRESERVED_REQUIREMENTS_START, "<\\!-- prime-agent:preserved-user-requirements:v1 --\\>")
+			.replaceAll(PRESERVED_REQUIREMENTS_END, "<\\!-- /prime-agent:preserved-user-requirements --\\>");
 		return `<requirement id="r${index + 1}">\n${escaped}\n</requirement>`;
 	});
 
-	return `${base}\n\n${PRESERVED_REQUIREMENTS_HEADING}\n${blocks.join("\n")}`;
+	return `${base}\n\n${PRESERVED_REQUIREMENTS_HEADING}\n${PRESERVED_REQUIREMENTS_START}\n${blocks.join("\n")}\n${PRESERVED_REQUIREMENTS_END}`;
+}
+
+function contentText(content: string | Array<{ type: string; text?: string }>): string {
+	if (typeof content === "string") return content;
+	return content
+		.filter((block): block is { type: "text"; text: string } => block.type === "text")
+		.map((block) => block.text)
+		.join("\n");
+}
+
+function messageTextForSafety(message: AgentMessage): string {
+	switch (message.role) {
+		case "user":
+		case "custom":
+		case "toolResult":
+			return contentText(message.content);
+		case "assistant": {
+			const parts: string[] = [];
+			for (const block of message.content) {
+				if (block.type === "text") parts.push(block.text);
+				else if (block.type === "thinking") parts.push(block.thinking);
+				else if (block.type === "toolCall") parts.push(block.name, JSON.stringify(block.arguments));
+			}
+			return parts.join("\n");
+		}
+		case "bashExecution":
+			return `${message.command}\n${message.output}`;
+		case "branchSummary":
+		case "compactionSummary":
+			return message.summary;
+	}
 }
 
 /** Build a source corpus for deterministic identifier validation. */
@@ -178,7 +219,7 @@ export function buildSummarySourceText(
 	previousSummary?: string,
 	customInstructions?: string,
 ): string {
-	return [JSON.stringify(messages), previousSummary ?? "", customInstructions ?? ""].join("\n");
+	return [messages.map(messageTextForSafety).join("\n"), previousSummary ?? "", customInstructions ?? ""].join("\n");
 }
 
 export function extractSummaryIdentifiers(text: string): SummaryIdentifiers {
@@ -187,7 +228,7 @@ export function extractSummaryIdentifiers(text: string): SummaryIdentifiers {
 
 	const commitPattern = /\b(?=[0-9a-f]{7,40}\b)(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/giu;
 	for (const match of text.matchAll(commitPattern)) {
-		commitShas.add(match[0].toLocaleLowerCase());
+		commitShas.add(match[0].toLowerCase());
 	}
 
 	const pullRequestPattern = /\b(?:PR|pull\s+request)\s*#\s*(\d+)\b/giu;
@@ -205,6 +246,9 @@ export function extractSummaryIdentifiers(text: string): SummaryIdentifiers {
 function validateSections(summary: string, kind: CompactionSummaryKind): void {
 	const requiredSections = kind === "history" ? HISTORY_REQUIRED_SECTIONS : TURN_PREFIX_REQUIRED_SECTIONS;
 	const lines = summary.split(/\r?\n/u).map((line) => line.trim());
+	const presentSections = requiredSections.filter((section) => lines.includes(section));
+	if (presentSections.length === 0) return;
+
 	let previousIndex = -1;
 
 	for (const section of requiredSections) {

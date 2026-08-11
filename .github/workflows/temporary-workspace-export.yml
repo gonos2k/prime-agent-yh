@@ -28,6 +28,24 @@ jobs:
         run: npm ci
       - name: Check formatting, lint, and types
         run: npm run check
+      - name: Revert unrelated baseline formatter drift
+        shell: bash
+        run: |
+          while IFS= read -r path; do
+            case "$path" in
+              packages/coding-agent/CHANGELOG.md|\
+              packages/coding-agent/src/core/compaction/compaction.ts|\
+              packages/coding-agent/src/core/compaction/index.ts|\
+              packages/coding-agent/src/core/compaction/summary-safety.ts|\
+              packages/coding-agent/test/compaction-summary-reasoning.test.ts|\
+              packages/coding-agent/test/compaction-summary-safety.test.ts)
+                ;;
+              *)
+                echo "Reverting unrelated formatter change: $path"
+                git restore -- "$path"
+                ;;
+            esac
+          done < <(git diff --name-only)
       - name: Run focused compaction tests
         working-directory: packages/coding-agent
         run: >-

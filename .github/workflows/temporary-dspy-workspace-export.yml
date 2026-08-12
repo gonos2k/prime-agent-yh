@@ -1,0 +1,21 @@
+name: Temporary DSPy workspace export
+
+on:
+  push:
+    branches:
+      - agent/dspy-compaction-optimizer
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dspy-compaction-workspace
+          path: .
+          include-hidden-files: true
+          retention-days: 1

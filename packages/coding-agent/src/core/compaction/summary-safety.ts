@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, TextContent } from "@earendil-works/pi-ai";
 
 export type CompactionSummaryKind = "history" | "turn-prefix";
 
@@ -58,7 +58,7 @@ function extractUserText(message: AgentMessage): string | undefined {
 	if (typeof message.content === "string") return message.content;
 
 	return message.content
-		.filter((block): block is { type: "text"; text: string } => block.type === "text")
+		.filter((block): block is TextContent => block.type === "text")
 		.map((block) => block.text)
 		.join("\n");
 }
@@ -182,10 +182,10 @@ export function appendPreservedUserRequirements(summary: string, requirements: s
 	return `${base}\n\n${PRESERVED_REQUIREMENTS_HEADING}\n${PRESERVED_REQUIREMENTS_START}\n${blocks.join("\n")}\n${PRESERVED_REQUIREMENTS_END}`;
 }
 
-function contentText(content: string | Array<{ type: string; text?: string }>): string {
+function contentText(content: string | (TextContent | ImageContent)[]): string {
 	if (typeof content === "string") return content;
 	return content
-		.filter((block): block is { type: "text"; text: string } => block.type === "text")
+		.filter((block): block is TextContent => block.type === "text")
 		.map((block) => block.text)
 		.join("\n");
 }
@@ -325,7 +325,7 @@ export function validateSummaryResponse(
 	}
 
 	const text = response.content
-		.filter((content): content is { type: "text"; text: string } => content.type === "text")
+		.filter((content): content is TextContent => content.type === "text")
 		.map((content) => content.text)
 		.join("\n");
 
